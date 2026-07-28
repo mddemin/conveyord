@@ -50,7 +50,8 @@ type Decision struct {
 	NextAttemptAt time.Time // zero when State is Dead
 }
 
-// OnFailure returns a decision of what to do with failed job, caller should increase job's attemptsAttempt must already include the failure being reported, otherwise every job gets one extra retry.
+// OnFailure returns a decision of what to do with failed job, caller should increase job's attempts.
+// Attempt must already include the failure being reported, otherwise every job gets one extra retry.
 func (p Policy) OnFailure(j *Job, cause error) Decision {
 	if IsPermanent(cause) || j.Attempt >= p.MaxAttempts {
 		return Decision{State: Dead}
