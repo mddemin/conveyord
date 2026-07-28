@@ -1,6 +1,9 @@
 package job
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestStateString(t *testing.T) {
 	if got := Pending.String(); got != "pending" {
@@ -26,5 +29,47 @@ func TestStateTerminal(t *testing.T) {
 				t.Errorf("%s.Terminal() = %v, want %v", tt.state, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestTransitionAllowed(t *testing.T) {
+	allowed := []struct{ from, to State }{
+		{Pending, Leased},
+		{Leased, Succeeded},
+		{Leased, Failed},
+		{Leased, Pending},
+		{Failed, Pending},
+		{Failed, Dead},
+	}
+
+	for _, tt := range allowed {
+		t.Run(tt.from.String()+"_to_"+tt.to.String(), func(t *testing.T) {
+			if err := Transition(tt.from, tt.to); err != nil {
+				t.Errorf("Transition(%s, %s) = %v, want nil", tt.from, tt.to, err)
+			}
+		})
+	}
+}
+
+func TestTransitionRejectsEverythingElse(t *testing.T) {
+	all := []State{Pending, Leased, Succeeded, Failed, Dead}
+	legal := map[State]map[State]bool{
+		Pending: {Leased: true},
+		Leased:  {Succeeded: true, Failed: true, Pending: true},
+		Failed:  {Pending: true, Dead: true},
+	}
+
+	for _, from := range all {
+		for _, to := range all {
+			if legal[from][to] {
+				continue
+			}
+			t.Run(from.String()+"_to_"+to.String(), func(t *testing.T) {
+				err := Transition(from, to)
+				if !errors.Is(err, ErrInvalidTransition) {
+					t.Errorf("Transition(%s, %s) = %v, want ErrInvalidTransition", from, to, err)
+				}
+			})
+		}
 	}
 }
