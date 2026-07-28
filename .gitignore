@@ -1,0 +1,13 @@
+# Compiled binaries (cmd/* build output)
+/conveyord
+/agent
+
+# Test and profiling output
+*.test
+*.out
+*.prof
+
+# Local config: Postgres DSN and friends from phase 3 on
+.env
+
+.obsidian/
