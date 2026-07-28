@@ -43,3 +43,24 @@ func (p Policy) jitter() float64 {
 	}
 	return p.Jitter()
 }
+
+// Decision shows OnFailure value the caller applies
+type Decision struct {
+	State         State     // Pending when the job will be retried, Dead when it will not
+	NextAttemptAt time.Time // zero when State is Dead
+}
+
+// OnFailure returns a decision of what to do with failed job, caller should increase job's attemptsAttempt must already include the failure being reported, otherwise every job gets one extra retry.
+func (p Policy) OnFailure(j *Job, cause error) Decision {
+	if IsPermanent(cause) || j.Attempt >= p.MaxAttempts {
+		return Decision{State: Dead}
+	}
+	return Decision{State: Pending, NextAttemptAt: p.now().Add(p.Backoff(j.Attempt))}
+}
+
+func (p Policy) now() time.Time {
+	if p.Clock == nil {
+		return time.Now()
+	}
+	return p.Clock.Now()
+}

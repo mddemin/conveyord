@@ -1,6 +1,9 @@
 package job
 
 import (
+	"errors"
+	"fmt"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -75,5 +78,98 @@ func TestBackoffStaysWithinWindowWithRealRandomness(t *testing.T) {
 
 	if len(seen) < 100 {
 		t.Errorf("got %d distinct delays over 1000 draws, want at least 100 — jitter looks constant", len(seen))
+	}
+}
+
+type fixedClock struct{ t time.Time }
+
+func (c fixedClock) Now() time.Time { return c.t }
+
+func TestOnFailure(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	p := Policy{
+		Base:        time.Second,
+		Max:         time.Minute,
+		MaxAttempts: 3,
+		Clock:       fixedClock{now},
+		Jitter:      noJitter,
+	}
+	boom := errors.New("boom")
+
+	tests := []struct {
+		name    string
+		attempt int
+		cause   error
+		want    Decision
+	}{
+		{
+			name:    "first failure retries after Base",
+			attempt: 1,
+			cause:   boom,
+			want:    Decision{State: Pending, NextAttemptAt: now.Add(time.Second)},
+		},
+		{
+			name:    "second failure backs off further",
+			attempt: 2,
+			cause:   boom,
+			want:    Decision{State: Pending, NextAttemptAt: now.Add(2 * time.Second)},
+		},
+		{
+			name:    "final attempt is buried",
+			attempt: 3,
+			cause:   boom,
+			want:    Decision{State: Dead},
+		},
+		{
+			name:    "beyond the limit stays buried",
+			attempt: 9,
+			cause:   boom,
+			want:    Decision{State: Dead},
+		},
+		{
+			name:    "permanent failure is buried on the first attempt",
+			attempt: 1,
+			cause:   Permanent(boom),
+			want:    Decision{State: Dead},
+		},
+		{
+			name:    "permanent failure wrapped in context is still buried",
+			attempt: 1,
+			cause:   fmt.Errorf("fetching url: %w", Permanent(boom)),
+			want:    Decision{State: Dead},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			j := &Job{ID: "j1", State: Failed, Attempt: tt.attempt}
+
+			got := p.OnFailure(j, tt.cause)
+			if got != tt.want {
+				t.Errorf("OnFailure() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOnFailureDoesNotMutateTheJob(t *testing.T) {
+	p := Policy{Base: time.Second, Max: time.Minute, MaxAttempts: 3, Jitter: noJitter}
+	j := &Job{ID: "j1", State: Failed, Attempt: 1}
+	before := *j
+
+	p.OnFailure(j, errors.New("boom"))
+
+	if !reflect.DeepEqual(*j, before) {
+		t.Errorf("OnFailure mutated the job: got %+v, want %+v", *j, before)
+	}
+}
+
+func TestOnFailureDecisionIsAppliable(t *testing.T) {
+	p := Policy{Base: time.Second, Max: time.Minute, MaxAttempts: 3, Jitter: noJitter}
+	j := &Job{ID: "j1", State: Failed, Attempt: 1}
+
+	d := p.OnFailure(j, errors.New("boom"))
+	if err := j.To(d.State); err != nil {
+		t.Fatalf("applying decision %s to a Failed job: %v", d.State, err)
 	}
 }
