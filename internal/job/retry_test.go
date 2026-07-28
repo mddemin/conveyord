@@ -49,3 +49,31 @@ func TestBackoffTreatsNonPositiveAttemptAsFirst(t *testing.T) {
 		}
 	}
 }
+
+func TestBackoffAppliesJitter(t *testing.T) {
+	p := Policy{Base: time.Second, Max: time.Minute, Jitter: func() float64 { return 0.25 }}
+
+	// The window for attempt 3 is 4s; a quarter of it is 1s.
+	if got, want := p.Backoff(3), time.Second; got != want {
+		t.Errorf("Backoff(3) = %v, want %v", got, want)
+	}
+}
+
+func TestBackoffStaysWithinWindowWithRealRandomness(t *testing.T) {
+	p := Policy{Base: 100 * time.Millisecond, Max: time.Second} // nil Jitter: real randomness
+
+	const window = 400 * time.Millisecond // attempt 3
+	seen := make(map[time.Duration]bool)
+
+	for range 1000 {
+		d := p.Backoff(3)
+		if d < 0 || d >= window {
+			t.Fatalf("Backoff(3) = %v, want within [0, %v)", d, window)
+		}
+		seen[d] = true
+	}
+
+	if len(seen) < 100 {
+		t.Errorf("got %d distinct delays over 1000 draws, want at least 100 — jitter looks constant", len(seen))
+	}
+}
