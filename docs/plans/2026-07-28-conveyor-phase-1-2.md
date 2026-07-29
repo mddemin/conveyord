@@ -18,7 +18,7 @@ Every task inherits these. A violation is a review finding whether or not the ta
 
 - **`internal/job` imports only the Go standard library.** No third-party module, ever. This is the architectural invariant of the whole project.
 - Go 1.26 (`mise.toml` already pins it; verify with `go version`).
-- Module path: `github.com/ypocat/conveyor`. Change it in Task 1 if you prefer a different one, but change it *before* Task 2 — renaming later touches every file.
+- Module path: `github.com/mddemin/conveyor`. Change it in Task 1 if you prefer a different one, but change it *before* Task 2 — renaming later touches every file.
 - `go test -race ./...` and `go vet ./...` pass before every commit.
 - **No `time.Sleep` in tests.** Time is injected, never waited on.
 - Code is `gofmt`-formatted. Run `gofmt -l .` — it must print nothing.
@@ -64,10 +64,10 @@ func (s State) Terminal() bool
 
 ```bash
 cd /home/mikhail/Projects/go-practice
-go mod init github.com/ypocat/conveyor
+go mod init github.com/mddemin/conveyor
 ```
 
-Expected: `go: creating new go.mod: module github.com/ypocat/conveyor`
+Expected: `go: creating new go.mod: module github.com/mddemin/conveyor`
 
 - [x] **Step 2: Write the failing test**
 
@@ -114,7 +114,7 @@ Run: `go test ./internal/job/ -run TestState -v`
 
 Expected: a **build** failure, not a test failure — `undefined: Pending`. That is the correct first failure; the test cannot compile because the thing it tests does not exist.
 
-- [ ] **Step 4: Write the implementation**
+- [x] **Step 4: Write the implementation**
 
 Create `internal/job/state.go`. It must contain:
 
@@ -126,13 +126,13 @@ Create `internal/job/state.go`. It must contain:
 
 The lifecycle you are encoding: a job is created `Pending`, is `Leased` to an agent, and ends `Succeeded` or `Dead`. `Failed` is transient — the retry policy in Task 7 moves it back to `Pending` or on to `Dead`.
 
-- [ ] **Step 5: Run the tests and watch them pass**
+- [x] **Step 5: Run the tests and watch them pass**
 
 Run: `go test ./internal/job/ -run TestState -v`
 
 Expected: `PASS`, with five subtests listed under `TestStateTerminal`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 gofmt -l . && go vet ./... && go test -race ./...
@@ -170,7 +170,7 @@ The legal transitions, which the test below encodes exhaustively:
 
 Everything else is illegal. `Succeeded` and `Dead` have no outgoing transitions.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Change the import block at the top of `internal/job/state_test.go` to:
 
@@ -231,20 +231,20 @@ The second test is the valuable one. It asserts the *complement* of the allowed 
 
 Worth noticing in that test, because you will want the same trick in the implementation: `legal[from][to]` where `from` is not a key returns the zero value of the inner map type — a nil map — and indexing a nil map is legal and returns false. No existence check needed.
 
-- [ ] **Step 2: Run the test and watch it fail**
+- [x] **Step 2: Run the test and watch it fail**
 
 Run: `go test ./internal/job/ -run TestTransition -v`
 
 Expected: build failure — `undefined: Transition`, `undefined: ErrInvalidTransition`.
 
-- [ ] **Step 3: Write the sentinel errors**
+- [x] **Step 3: Write the sentinel errors**
 
 Create `internal/job/errors.go` with two package-level sentinels built by `errors.New`:
 
 - `ErrInvalidTransition` — a state change the lifecycle forbids.
 - `ErrNotFound` — no job exists with the requested identifier. Nothing uses this yet; it lives here so phase 3's store does not invent a competing version, and so phase 5's HTTP layer has exactly one thing to map to a 404. Say that in its doc comment.
 
-- [ ] **Step 4: Write the transition table**
+- [x] **Step 4: Write the transition table**
 
 Add to `internal/job/state.go`:
 
@@ -256,13 +256,13 @@ Two things to get right:
 1. **Terminal states need no special case.** Indexing the map with a state that is not a key yields a nil slice, and `slices.Contains` on a nil slice is false. If you find yourself writing a comma-ok check or an explicit terminal branch, you are working harder than the language requires.
 2. **The error must satisfy `errors.Is(err, ErrInvalidTransition)` while still naming the specific pair.** That means wrapping with `%w` inside an `fmt.Errorf`, not returning the bare sentinel. `errors.Is` walks the wrap chain; a human reading a log needs to see *which* transition was refused.
 
-- [ ] **Step 5: Run the tests and watch them pass**
+- [x] **Step 5: Run the tests and watch them pass**
 
 Run: `go test ./internal/job/ -v`
 
 Expected: `PASS`. `TestTransitionRejectsEverythingElse` should report 19 subtests.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 gofmt -l . && go vet ./... && go test -race ./...
@@ -287,21 +287,21 @@ func (j *Job) To(next State) error
 
 `Job` has exactly these fields, in this order:
 
-| Field | Type | Meaning |
-|---|---|---|
-| `ID` | `string` | unique identifier |
-| `Type` | `string` | selects the executor that runs the job |
-| `Payload` | `[]byte` | the executor's opaque input |
-| `State` | `State` | current lifecycle position |
-| `Attempt` | `int` | **completed** attempts; zero before the first run |
-| `CreatedAt` | `time.Time` | set by the storage layer in phase 3 |
-| `UpdatedAt` | `time.Time` | set by the storage layer in phase 3 |
+| Field       | Type        | Meaning                                           |
+| ----------- | ----------- | ------------------------------------------------- |
+| `ID`        | `string`    | unique identifier                                 |
+| `Type`      | `string`    | selects the executor that runs the job            |
+| `Payload`   | `[]byte`    | the executor's opaque input                       |
+| `State`     | `State`     | current lifecycle position                        |
+| `Attempt`   | `int`       | **completed** attempts; zero before the first run |
+| `CreatedAt` | `time.Time` | set by the storage layer in phase 3               |
+| `UpdatedAt` | `time.Time` | set by the storage layer in phase 3               |
 
 Deliberately absent: lease fields (phase 4 adds them), `MaxAttempts` (the `Policy` owns it — one place, not two), and `NextAttemptAt` (Task 7's `Decision` carries it; the store persists it). Do not add fields on speculation. Every field here has a consumer in this plan or the next phase, and I will ask you to justify any you add.
 
 `Attempt` counting **completed** attempts is a decision Task 7 depends on. The caller increments it when a job moves `Leased -> Failed`, so by the time the retry policy sees the job, the attempt that just failed is already counted. Fix that in your head now.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `internal/job/job_test.go`:
 
@@ -339,7 +339,7 @@ func TestJobToRejectsIllegalTransition(t *testing.T) {
 
 The second assertion in each test is the one that matters. A rejected transition must leave the job untouched — a method that returns an error *and* mutates is how you get corrupt state that only surfaces three layers away.
 
-- [ ] **Step 2: Run the test and watch it fail**
+- [x] **Step 2: Run the test and watch it fail**
 
 Run: `go test ./internal/job/ -run TestJob -v`
 
@@ -355,13 +355,13 @@ Create `internal/job/job.go` with the struct above and the `To` method.
 - **Validate, then mutate — never the reverse.** Delegate validation to `Transition` rather than duplicating the table's knowledge, and on failure return early with the error unchanged so `errors.Is` still works upstream.
 - Doc comments on the type, on each field whose meaning is not obvious from its name (`Type`, `Payload`, and `Attempt` all need one), and on the method — including the guarantee that a rejected transition leaves the job unchanged. That guarantee is part of the contract, so it belongs in the docs, not only in the test.
 
-- [ ] **Step 4: Run the tests and watch them pass**
+- [x] **Step 4: Run the tests and watch them pass**
 
 Run: `go test ./internal/job/ -v`
 
 Expected: `PASS`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 gofmt -l . && go vet ./... && go test -race ./...
@@ -411,7 +411,7 @@ Full jitter rather than plain exponential because a thousand jobs failing agains
 
 **Why `Jitter` is a `func() float64` and not a seeded `*rand.Rand`.** Injecting a function lets this task's tests pin the draw to an exact value and assert the exponential sequence precisely, while Task 5 tests the randomness separately. Injecting a seed instead would couple your assertions to the internals of Go's PRNG, which is explicitly not guaranteed stable across releases.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `internal/job/retry_test.go`:
 
@@ -469,13 +469,13 @@ func TestBackoffTreatsNonPositiveAttemptAsFirst(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run the test and watch it fail**
+- [x] **Step 2: Run the test and watch it fail**
 
 Run: `go test ./internal/job/ -run TestBackoff -v`
 
 Expected: build failure — `undefined: Policy`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Create `internal/job/retry.go` with the `Clock` interface, the `Policy` struct, and `Backoff`.
 
@@ -487,13 +487,13 @@ Three things to get right, and one of them is a trap:
 
 On `Clock`: notice it is declared *here*, in the package that consumes it, with exactly one method — not exported from a shared `clock` package carrying `Now`, `Since`, `After`, and `Timer`. This is the most important interface convention in Go and the one people arriving from Java or C# get wrong most often: **the consumer declares the interface, and it contains only what the consumer uses.** Write its doc comment to say why it exists (tests inject a fixed time), not what it does (obvious).
 
-- [ ] **Step 4: Run the tests and watch them pass**
+- [x] **Step 4: Run the tests and watch them pass**
 
 Run: `go test ./internal/job/ -run TestBackoff -v`
 
 Expected: `PASS`, ten subtests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 gofmt -l . && go vet ./... && go test -race ./...
@@ -512,7 +512,7 @@ git commit -m "feat(job): add retry Policy with exponential backoff"
 
 Task 4 pinned the random draw, which means nothing written so far proves the jitter exists at all. A `Backoff` that ignored `p.Jitter` entirely and returned the ceiling of the window would pass every test in this repo. This task closes that hole and checks the nil default works.
 
-- [ ] **Step 1: Write the tests**
+- [x] **Step 1: Write the tests**
 
 Append to `internal/job/retry_test.go`:
 
@@ -548,7 +548,7 @@ func TestBackoffStaysWithinWindowWithRealRandomness(t *testing.T) {
 
 The second is a property test rather than an example test: it asserts an invariant that must hold for *every* draw (in range), plus a statistical fact that fails loudly if the jitter is stubbed out (many distinct values). The threshold of 100 out of 1000 sits far below what real randomness produces and far above what a constant produces, so it will not flake.
 
-- [ ] **Step 2: Run the tests — they should pass immediately**
+- [x] **Step 2: Run the tests — they should pass immediately**
 
 Run: `go test ./internal/job/ -run TestBackoff -v`
 
@@ -556,7 +556,7 @@ Expected: **PASS**, because Task 4's implementation is already correct.
 
 This is the one place in the plan where tests come after the code they cover, and it is worth understanding why that is acceptable rather than a lapse. These tests do not drive new behavior; they close a gap in the existing suite. Which means you have not yet watched them fail, and an unfailed test is worthless — so:
 
-- [ ] **Step 3: Verify the tests actually bite, then revert**
+- [x] **Step 3: Verify the tests actually bite, then revert**
 
 ```bash
 # Temporarily break Backoff: return the window itself, ignoring jitter entirely.
@@ -570,7 +570,7 @@ go test ./internal/job/ -run TestBackoff
 
 Do this literally. It takes thirty seconds, and it is the difference between a test suite and a suite-shaped pile of green ticks.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 gofmt -l . && go vet ./... && go test -race ./...
@@ -597,7 +597,7 @@ Not every failure deserves a retry. A `503` from a job's target is worth trying 
 
 This is the `errors.As` half of Go's error model, distinct from the `errors.Is` sentinels in Task 2. Sentinels answer *which* error is this; type-based wrapping answers *what kind of* error is this. "Permanent" is a kind.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `internal/job/permanent_test.go`:
 
@@ -658,13 +658,13 @@ Two of these constrain the design more than they look:
 - `TestPermanentPreservesTheUnderlyingError` forbids a marker that swallows its cause. That is the classic way custom error types make a codebase worse — every `errors.Is` check upstream silently stops working.
 - `TestPermanentOfNilIsNil` matters because `Permanent(nil)` returning a non-nil error makes the very common `return Permanent(doThing())` report failure on success. It is a cousin of the nil-pointer-in-a-non-nil-interface trap, and it is worth meeting here rather than in production.
 
-- [ ] **Step 2: Run the test and watch it fail**
+- [x] **Step 2: Run the test and watch it fail**
 
 Run: `go test ./internal/job/ -run Permanent -v`
 
 Expected: build failure — `undefined: Permanent`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Create `internal/job/permanent.go`. The shape:
 
@@ -675,13 +675,13 @@ Create `internal/job/permanent.go`. The shape:
 
 One decision to make consciously: **value receiver or pointer receiver on the marker type?** It changes what `errors.As` needs as a target and whether two markings of the same cause compare equal. Pick one and be ready to say why in review.
 
-- [ ] **Step 4: Run the tests and watch them pass**
+- [x] **Step 4: Run the tests and watch them pass**
 
 Run: `go test ./internal/job/ -run Permanent -v`
 
 Expected: `PASS`, seven subtests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 gofmt -l . && go vet ./... && go test -race ./...
@@ -837,7 +837,7 @@ Three notes on these tests.
 
 `TestOnFailureDecisionIsAppliable` is the seam between the two halves of this phase: it proves the retry policy only ever produces states the state machine will actually accept from `Failed`. Without it the two components can drift apart and nothing notices until runtime.
 
-- [ ] **Step 2: Run the test and watch it fail**
+- [x] **Step 2: Run the test and watch it fail**
 
 Run: `go test ./internal/job/ -run TestOnFailure -v`
 
@@ -858,7 +858,7 @@ Expected: `PASS`. Every test from Tasks 1 through 7 runs.
 - [ ] **Step 5: Verify the package really is dependency-free**
 
 ```bash
-go list -deps ./internal/job | grep -v '^internal/' | grep '\.' || echo "stdlib only"
+go list -deps ./internal/job | grep -v '^github.com/mddemin/conveyor' | grep '\.' || echo "stdlib only"
 ```
 
 Expected: `stdlib only`. Any line containing a dot is a module path, meaning something outside the standard library crept in. This is the mechanical form of the project's central invariant — run it at the end of every future phase that touches this package.
