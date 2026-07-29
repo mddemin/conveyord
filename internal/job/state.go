@@ -29,7 +29,7 @@ func (s State) String() string {
 
 // Terminal reports whether the state has no outgoing transitions.
 func (s State) Terminal() bool {
-	return s == Succeeded || s == Dead
+	return len(transitions[s]) == 0
 }
 
 var transitions = map[State][]State{
@@ -38,7 +38,7 @@ var transitions = map[State][]State{
 	Failed:  {Pending, Dead},
 }
 
-// Transition returns error if transition to next state is not possible.
+// Transition returns ErrInvalidTransition if transition to next state is not possible.
 func Transition(from, to State) error {
 	if !slices.Contains(transitions[from], to) {
 		return fmt.Errorf("%w: from %s to %s", ErrInvalidTransition, from, to)

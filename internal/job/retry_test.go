@@ -173,3 +173,13 @@ func TestOnFailureDecisionIsAppliable(t *testing.T) {
 		t.Fatalf("applying decision %s to a Failed job: %v", d.State, err)
 	}
 }
+
+func TestOnFailureMaxAttemptsZero(t *testing.T) {
+	p := Policy{Base: time.Second, Max: time.Minute, MaxAttempts: 0, Jitter: noJitter}
+	j := &Job{ID: "j1", State: Failed, Attempt: 1}
+
+	d := p.OnFailure(j, errors.New("boom"))
+	if d.State != Pending {
+		t.Fatalf("Job should be Pending: %v", d.State)
+	}
+}

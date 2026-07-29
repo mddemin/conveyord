@@ -14,7 +14,7 @@ type Clock interface {
 type Policy struct {
 	Base        time.Duration  // delay window after the first failure
 	Max         time.Duration  // cap on the window, however many attempts
-	MaxAttempts int            // attempts after which a job is buried
+	MaxAttempts int            // attempts after which a job is buried, 0 means no limit
 	Clock       Clock          // nil means the wall clock
 	Jitter      func() float64 // returns [0,1); nil means rand.Float64
 }
@@ -53,7 +53,7 @@ type Decision struct {
 // OnFailure returns a decision of what to do with failed job, caller should increase job's attempts.
 // Attempt must already include the failure being reported, otherwise every job gets one extra retry.
 func (p Policy) OnFailure(j *Job, cause error) Decision {
-	if IsPermanent(cause) || j.Attempt >= p.MaxAttempts {
+	if IsPermanent(cause) || (j.Attempt >= p.MaxAttempts && p.MaxAttempts > 0) {
 		return Decision{State: Dead}
 	}
 	return Decision{State: Pending, NextAttemptAt: p.now().Add(p.Backoff(j.Attempt))}
