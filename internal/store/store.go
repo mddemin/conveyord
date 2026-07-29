@@ -49,3 +49,25 @@ func (s *Store) Enqueue(ctx context.Context, j *job.Job) error {
 	})
 	return err
 }
+
+const q = `
+      SELECT id, type, payload, state, attempt, created_at, updated_at
+      FROM jobs
+      WHERE id = $1`
+
+// Get returns the job with the given id.
+// It returns an error wrapping job.ErrNotFound if no such job exists.
+func (s *Store) Get(ctx context.Context, id string) (*job.Job, error) {
+	var j job.Job
+
+	err := s.pool.QueryRow(ctx, q, id).Scan(
+		&j.ID, &j.Type, &j.Payload, &j.State, &j.Attempt, &j.CreatedAt, &j.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("%w: %s", job.ErrNotFound, id)
+		}
+		return nil, err
+	}
+
+	return &j, nil
+}
