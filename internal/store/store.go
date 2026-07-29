@@ -50,17 +50,24 @@ func (s *Store) Enqueue(ctx context.Context, j *job.Job) error {
 	return err
 }
 
-const q = `
+const getJobSQL = `
       SELECT id, type, payload, state, attempt, created_at, updated_at
       FROM jobs
       WHERE id = $1`
+
+const listJobSQL = `
+      SELECT id, type, payload, state, attempt, created_at, updated_at
+      FROM jobs
+      WHERE ($1 = '' OR state = $1)
+      ORDER BY created_at DESC, id DESC
+      LIMIT $2`
 
 // Get returns the job with the given id.
 // It returns an error wrapping job.ErrNotFound if no such job exists.
 func (s *Store) Get(ctx context.Context, id string) (*job.Job, error) {
 	var j job.Job
 
-	err := s.pool.QueryRow(ctx, q, id).Scan(
+	err := s.pool.QueryRow(ctx, getJobSQL, id).Scan(
 		&j.ID, &j.Type, &j.Payload, &j.State, &j.Attempt, &j.CreatedAt, &j.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -70,4 +77,41 @@ func (s *Store) Get(ctx context.Context, id string) (*job.Job, error) {
 	}
 
 	return &j, nil
+}
+
+// Filter narrows a List query. The zero Filter matches every job.
+type Filter struct {
+	State job.State // empty matches any state
+	Limit int       // non-positive means DefaultLimit
+}
+
+// DefaultLimit caps a List that did not ask for a limit.
+const DefaultLimit = 100
+
+// List returns jobs matching f, newest first.
+func (s *Store) List(ctx context.Context, f Filter) ([]job.Job, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = DefaultLimit
+	}
+
+	rows, err := s.pool.Query(ctx, listJobSQL, f.State, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []job.Job
+	for rows.Next() {
+		var j job.Job
+		err = rows.Scan(&j.ID, &j.Type, &j.Payload, &j.State, &j.Attempt, &j.CreatedAt, &j.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return jobs, nil
 }

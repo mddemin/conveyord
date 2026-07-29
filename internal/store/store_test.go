@@ -85,3 +85,57 @@ func TestGetUnknownIDIsNotFound(t *testing.T) {
 		t.Fatalf("Get of an unknown id returned %v, want job.ErrNotFound", err)
 	}
 }
+
+func TestListFiltersAndOrders(t *testing.T) {
+	s := freshDB(t)
+	ctx := t.Context()
+
+	for _, id := range []string{"j1", "j2", "j3"} {
+		if err := s.Enqueue(ctx, &job.Job{ID: id, Type: "resize"}); err != nil {
+			t.Fatalf("Enqueue %s: %v", id, err)
+		}
+	}
+
+	all, err := s.List(ctx, Filter{})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("List returned %d jobs, want 3", len(all))
+	}
+
+	pending, err := s.List(ctx, Filter{State: job.Pending})
+	if err != nil {
+		t.Fatalf("List pending: %v", err)
+	}
+	if len(pending) != 3 {
+		t.Errorf("List by state returned %d jobs, want 3", len(pending))
+	}
+
+	dead, err := s.List(ctx, Filter{State: job.Dead})
+	if err != nil {
+		t.Fatalf("List dead: %v", err)
+	}
+	if len(dead) != 0 {
+		t.Errorf("List of an unused state returned %d jobs, want 0", len(dead))
+	}
+}
+
+func TestListRespectsLimit(t *testing.T) {
+	s := freshDB(t)
+	ctx := t.Context()
+
+	for _, id := range []string{"j1", "j2", "j3"} {
+		if err := s.Enqueue(ctx, &job.Job{ID: id, Type: "resize"}); err != nil {
+			t.Fatalf("Enqueue %s: %v", id, err)
+		}
+	}
+
+	got, err := s.List(ctx, Filter{Limit: 2})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("List with Limit 2 returned %d jobs", len(got))
+	}
+}
