@@ -24,6 +24,15 @@ func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
+const insertJobSQL = `
+      INSERT INTO jobs (id, type, payload, state)
+	    VALUES ($1, $2, $3, $4)
+	    RETURNING created_at, updated_at`
+
+const insertJobEventSQL = `
+	    INSERT INTO job_events (job_id, state)
+	    VALUES ($1, $2)`
+
 // Enqueue inserts j as a new pending job and fills in its
 // State, Attempt, CreatedAt and UpdatedAt from the stored row.
 func (s *Store) Enqueue(ctx context.Context, j *job.Job) error {
@@ -33,7 +42,7 @@ func (s *Store) Enqueue(ctx context.Context, j *job.Job) error {
 			payload = []byte{}
 		}
 		err := tx.QueryRow(ctx,
-			"INSERT INTO jobs (id, type, payload, state) VALUES ($1, $2, $3, $4) RETURNING created_at, updated_at",
+			insertJobSQL,
 			j.ID, j.Type, payload, job.Pending).Scan(&j.CreatedAt, &j.UpdatedAt)
 		if err != nil {
 			var pgErr *pgconn.PgError
@@ -42,14 +51,14 @@ func (s *Store) Enqueue(ctx context.Context, j *job.Job) error {
 					return fmt.Errorf("job id %s: %w", j.ID, ErrDuplicate)
 				}
 			}
-			return err
+			return fmt.Errorf("inserting job %s: %w", j.ID, err)
 		}
 		j.Attempt = 0
 		j.State = job.Pending
 
-		_, err = tx.Exec(ctx, "INSERT INTO job_events (job_id, state) VALUES ($1, $2)", j.ID, j.State)
+		_, err = tx.Exec(ctx, insertJobEventSQL, j.ID, j.State)
 		if err != nil {
-			return err
+			return fmt.Errorf("recording enqueue event for job %s: %w", j.ID, err)
 		}
 
 		return nil
@@ -80,7 +89,7 @@ func (s *Store) Get(ctx context.Context, id string) (*job.Job, error) {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("%w: %s", job.ErrNotFound, id)
 		}
-		return nil, err
+		return nil, fmt.Errorf("getting job %s: %w", id, err)
 	}
 
 	return &j, nil
@@ -92,7 +101,7 @@ type Filter struct {
 	Limit int       // non-positive means DefaultLimit
 }
 
-// DefaultLimit caps a List that did not ask for a limit.
+// DefaultLimit caps a List that did not ask for a limit and caps for Events.
 const DefaultLimit = 100
 
 // List returns jobs matching f, newest first.
@@ -104,7 +113,7 @@ func (s *Store) List(ctx context.Context, f Filter) ([]job.Job, error) {
 
 	rows, err := s.pool.Query(ctx, listJobSQL, f.State, limit)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list jobs (state=%q limit=%d): %w", f.State, limit, err)
 	}
 	defer rows.Close()
 
@@ -113,12 +122,12 @@ func (s *Store) List(ctx context.Context, f Filter) ([]job.Job, error) {
 		var j job.Job
 		err = rows.Scan(&j.ID, &j.Type, &j.Payload, &j.State, &j.Attempt, &j.CreatedAt, &j.UpdatedAt)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scanning jobs (state=%q limit=%d): %w", f.State, limit, err)
 		}
 		jobs = append(jobs, j)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("iterating jobs (state=%q limit=%d): %w", f.State, limit, err)
 	}
 	return jobs, nil
 }
