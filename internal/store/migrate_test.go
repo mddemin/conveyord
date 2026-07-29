@@ -32,18 +32,24 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	}
 	ctx := t.Context()
 
+	countApplied := func() int {
+		t.Helper()
+		var n int
+		if err := testPool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&n); err != nil {
+			t.Fatalf("counting migrations: %v", err)
+		}
+		return n
+	}
+
 	if err := Migrate(ctx, testPool); err != nil {
 		t.Fatalf("first Migrate: %v", err)
 	}
+	want := countApplied()
+
 	if err := Migrate(ctx, testPool); err != nil {
 		t.Fatalf("second Migrate: %v", err)
 	}
-
-	var applied int
-	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&applied); err != nil {
-		t.Fatalf("counting migrations: %v", err)
-	}
-	if applied != 1 {
-		t.Errorf("schema_migrations has %d rows after two runs, want 1", applied)
+	if got := countApplied(); got != want {
+		t.Errorf("schema_migrations has %d rows after a second run, want %d", got, want)
 	}
 }
