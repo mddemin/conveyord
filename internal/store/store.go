@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -45,6 +46,12 @@ func (s *Store) Enqueue(ctx context.Context, j *job.Job) error {
 		}
 		j.Attempt = 0
 		j.State = job.Pending
+
+		_, err = tx.Exec(ctx, "INSERT INTO job_events (job_id, state) VALUES ($1, $2)", j.ID, j.State)
+		if err != nil {
+			return err
+		}
+
 		return nil
 	})
 	return err
@@ -114,4 +121,33 @@ func (s *Store) List(ctx context.Context, f Filter) ([]job.Job, error) {
 		return nil, err
 	}
 	return jobs, nil
+}
+
+// Event is one recorded step in a job's lifecycle.
+// Lives here while storage is the only consumer; revisit if transports need it.
+type Event struct {
+	JobID     string
+	State     job.State
+	Message   string
+	CreatedAt time.Time
+}
+
+const listJobEventsSQL = `
+      SELECT job_id, state, message, created_at
+      FROM job_events
+      WHERE job_id = $1
+      ORDER BY id ASC
+      LIMIT $2`
+
+// Events returns up to DefaultLimit events for a job, oldest first.
+func (s *Store) Events(ctx context.Context, jobID string) ([]Event, error) {
+	rows, err := s.pool.Query(ctx, listJobEventsSQL, jobID, DefaultLimit)
+	if err != nil {
+		return nil, fmt.Errorf("events for job %s: %w", jobID, err)
+	}
+	events, err := pgx.CollectRows(rows, pgx.RowToStructByName[Event])
+	if err != nil {
+		return nil, fmt.Errorf("events for job %s: %w", jobID, err)
+	}
+	return events, nil
 }

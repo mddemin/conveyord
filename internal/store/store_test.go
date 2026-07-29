@@ -139,3 +139,58 @@ func TestListRespectsLimit(t *testing.T) {
 		t.Errorf("List with Limit 2 returned %d jobs", len(got))
 	}
 }
+
+func TestEnqueueRecordsAnEvent(t *testing.T) {
+	s := freshDB(t)
+	ctx := t.Context()
+
+	if err := s.Enqueue(ctx, &job.Job{ID: "j1", Type: "resize"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	events, err := s.Events(ctx, "j1")
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("Events returned %d events after Enqueue, want 1", len(events))
+	}
+	if events[0].State != job.Pending {
+		t.Errorf("first event State = %s, want %s", events[0].State, job.Pending)
+	}
+	if events[0].JobID != "j1" {
+		t.Errorf("first event JobID = %s, want j1", events[0].JobID)
+	}
+}
+
+func TestFailedEnqueueWritesNothing(t *testing.T) {
+	s := freshDB(t)
+	ctx := t.Context()
+
+	if err := s.Enqueue(ctx, &job.Job{ID: "j1", Type: "resize"}); err != nil {
+		t.Fatalf("first Enqueue: %v", err)
+	}
+	if err := s.Enqueue(ctx, &job.Job{ID: "j1", Type: "other"}); !errors.Is(err, ErrDuplicate) {
+		t.Fatalf("second Enqueue returned %v, want ErrDuplicate", err)
+	}
+
+	events, err := s.Events(ctx, "j1")
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Errorf("job has %d events after a rejected duplicate Enqueue, want 1", len(events))
+	}
+}
+
+func TestEventsOfUnknownJobIsEmpty(t *testing.T) {
+	s := freshDB(t)
+
+	events, err := s.Events(t.Context(), "nope")
+	if err != nil {
+		t.Fatalf("Events of an unknown job: %v", err)
+	}
+	if len(events) != 0 {
+		t.Errorf("got %d events, want 0", len(events))
+	}
+}
