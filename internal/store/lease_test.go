@@ -39,6 +39,23 @@ func enqueueN(t *testing.T, s *Store, n int) {
 	}
 }
 
+func leaseN(t *testing.T, s *Store, n int, leasedBy string) []job.Job {
+	t.Helper()
+	enqueueN(t, s, n)
+
+	jobs, err := s.Lease(t.Context(), leasedBy, n, time.Minute)
+	if err != nil {
+		t.Fatalf("Lease: %v", err)
+	}
+	return jobs
+}
+
+func TestLeaseFollowsTheStateMachine(t *testing.T) {
+	if err := job.Transition(job.Pending, job.Leased); err != nil {
+		t.Fatalf("leaseJobSQL hardcodes pending -> leased, which the domain rejects: %v", err)
+	}
+}
+
 func TestLeaseClaimsPendingJobs(t *testing.T) {
 	s := freshDB(t)
 	enqueueN(t, s, 5)
@@ -71,40 +88,6 @@ func TestLeaseTakesOldestFirst(t *testing.T) {
 	slices.Sort(gotIDs)
 	if !slices.Equal(gotIDs, []string{"j000", "j001"}) {
 		t.Errorf("Lease returned %v, want the two oldest jobs", gotIDs)
-	}
-}
-
-func TestLeaseRecordsAnEvent(t *testing.T) {
-	s := freshDB(t)
-	enqueueN(t, s, 2)
-	ctx := t.Context()
-
-	if _, err := s.Lease(ctx, "agent-7", 1, time.Minute); err != nil {
-		t.Fatalf("Lease: %v", err)
-	}
-
-	events, err := s.Events(ctx, "j000")
-	if err != nil {
-		t.Fatalf("Events: %v", err)
-	}
-	if len(events) != 2 {
-		t.Fatalf("job has %d events, want 2 (enqueue and lease)", len(events))
-	}
-	last := events[1]
-	if last.State != job.Leased {
-		t.Errorf("last event state is %s, want %s", last.State, job.Leased)
-	}
-	if !strings.Contains(last.Message, "agent-7") {
-		t.Errorf("last event message is %q, want it to name the leaseholder", last.Message)
-	}
-
-	// The job nobody leased must not have picked up an event.
-	untouched, err := s.Events(ctx, "j001")
-	if err != nil {
-		t.Fatalf("Events: %v", err)
-	}
-	if len(untouched) != 1 {
-		t.Errorf("unleased job has %d events, want 1", len(untouched))
 	}
 }
 
@@ -234,5 +217,39 @@ func TestLeaseIsExclusiveUnderConcurrency(t *testing.T) {
 	}
 	if len(claimed) != jobs {
 		t.Errorf("leasers claimed %d jobs in total, want %d", len(claimed), jobs)
+	}
+}
+
+func TestLeaseRecordsAnEvent(t *testing.T) {
+	s := freshDB(t)
+	enqueueN(t, s, 2)
+	ctx := t.Context()
+
+	if _, err := s.Lease(ctx, "agent-7", 1, time.Minute); err != nil {
+		t.Fatalf("Lease: %v", err)
+	}
+
+	events, err := s.Events(ctx, "j000")
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("job has %d events, want 2 (enqueue and lease)", len(events))
+	}
+	last := events[1]
+	if last.State != job.Leased {
+		t.Errorf("last event state is %s, want %s", last.State, job.Leased)
+	}
+	if !strings.Contains(last.Message, "agent-7") {
+		t.Errorf("last event message is %q, want it to name the leaseholder", last.Message)
+	}
+
+	// The job nobody leased must not have picked up an event.
+	untouched, err := s.Events(ctx, "j001")
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(untouched) != 1 {
+		t.Errorf("unleased job has %d events, want 1", len(untouched))
 	}
 }

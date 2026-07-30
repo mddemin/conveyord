@@ -26,12 +26,12 @@ func New(pool *pgxpool.Pool) *Store {
 
 const insertJobSQL = `
       INSERT INTO jobs (id, type, payload, state)
-	    VALUES ($1, $2, $3, $4)
-	    RETURNING created_at, updated_at`
+      VALUES ($1, $2, $3, $4)
+      RETURNING created_at, updated_at`
 
 const insertJobEventSQL = `
-	    INSERT INTO job_events (job_id, state)
-	    VALUES ($1, $2)`
+      INSERT INTO job_events (job_id, state)
+      VALUES ($1, $2)`
 
 // Enqueue inserts j as a new pending job and fills in its
 // State, Attempt, CreatedAt and UpdatedAt from the stored row.
@@ -208,4 +208,62 @@ func (s *Store) Lease(ctx context.Context, leasedBy string, n int, d time.Durati
 		return nil, fmt.Errorf("collect jobs leased by %s: %w", leasedBy, err)
 	}
 	return jobs, nil
+}
+
+const renewJobSQL = `
+      UPDATE jobs
+      SET lease_expires_at = now() + $3,
+          updated_at       = now()
+      WHERE id = $1 AND leased_by = $2 AND state = 'leased'`
+
+// Renew extends the lease on a job held by leasedBy.
+// It returns an error wrapping job.ErrNotFound if the job is not leased by
+// leasedBy — because the lease expired and someone else took it, or because it
+// never held it.
+func (s *Store) Renew(ctx context.Context, id, leasedBy string, d time.Duration) error {
+	ct, err := s.pool.Exec(ctx, renewJobSQL, id, leasedBy, d)
+	if err != nil {
+		return fmt.Errorf("renew job %s leased by %s: %w", id, leasedBy, err)
+	}
+	if ct.RowsAffected() != 1 {
+		return fmt.Errorf("%w: %s", job.ErrNotFound, id)
+	}
+	return nil
+}
+
+const completeJobSQL = `
+      WITH leased AS (
+          UPDATE jobs
+          SET state            = $4,
+              lease_expires_at = NULL,
+              leased_by        = NULL,
+              updated_at       = now()
+          WHERE id = $1 AND leased_by = $2 AND state = 'leased'
+          RETURNING id, state
+      ), logged AS (
+          INSERT INTO job_events (job_id, state, message)
+          SELECT id, state, $3 FROM leased
+      )
+      SELECT * FROM leased`
+
+// Complete moves a leased job to a terminal state and records an event.
+// state must be terminal and reachable from job.Leased, which today means
+// job.Succeeded. Burial goes through Fail, which reaches job.Dead by way of
+// job.Failed so the retry policy gets a say.
+func (s *Store) Complete(ctx context.Context, id, leasedBy string, state job.State, message string) error {
+	err := job.Transition(job.Leased, state)
+	if err != nil {
+		return fmt.Errorf("transiting job %s: %w", id, err)
+	}
+	if !state.Terminal() {
+		return fmt.Errorf("completing job %s: %s is not terminal", id, state)
+	}
+	ct, err := s.pool.Exec(ctx, completeJobSQL, id, leasedBy, message, state)
+	if err != nil {
+		return fmt.Errorf("completing job %s leased by %s: %w", id, leasedBy, err)
+	}
+	if ct.RowsAffected() != 1 {
+		return fmt.Errorf("%w: %s", job.ErrNotFound, id)
+	}
+	return nil
 }
