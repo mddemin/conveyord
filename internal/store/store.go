@@ -267,3 +267,41 @@ func (s *Store) Complete(ctx context.Context, id, leasedBy string, state job.Sta
 	}
 	return nil
 }
+
+// logged reads from expired, not reaped: by the time the UPDATE's RETURNING
+// runs, leased_by is already NULL, and the dead agent's name survives only in
+// the rows the first CTE locked.
+const reapExpiredSQL = `
+      WITH expired AS (
+          SELECT id, leased_by FROM jobs
+          WHERE state = 'leased' AND lease_expires_at < now()
+          ORDER BY lease_expires_at
+          LIMIT $1
+          FOR UPDATE SKIP LOCKED
+      ), reaped AS (
+          UPDATE jobs
+          SET state            = 'pending',
+              lease_expires_at = NULL,
+              leased_by        = NULL,
+              updated_at       = now()
+          FROM expired
+          WHERE jobs.id = expired.id
+          RETURNING jobs.id
+      ), logged AS (
+          INSERT INTO job_events (job_id, state, message)
+          SELECT id, 'pending', 'reaped, was leased by ' || leased_by FROM expired
+      )
+      SELECT count(*) FROM reaped`
+
+// ReapExpired returns jobs whose lease has expired to the pending state and
+// records an event for each. It returns the number of jobs reaped, at most
+// DefaultLimit per call — a backlog drains over several ticks rather than in
+// one long transaction.
+func (s *Store) ReapExpired(ctx context.Context) (int, error) {
+	var reaped int
+	err := s.pool.QueryRow(ctx, reapExpiredSQL, DefaultLimit).Scan(&reaped)
+	if err != nil {
+		return 0, fmt.Errorf("reaping jobs: %w", err)
+	}
+	return reaped, nil
+}
