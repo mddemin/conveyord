@@ -160,3 +160,52 @@ func (s *Store) Events(ctx context.Context, jobID string) ([]Event, error) {
 	}
 	return events, nil
 }
+
+// The pending -> leased transition is spelled out here as well as in
+// job.transitions: a set-based UPDATE cannot call job.Transition per row
+// without giving up SKIP LOCKED. Changing the state machine means changing
+// this query too.
+const leaseJobSQL = `
+      WITH leased AS (
+          UPDATE jobs
+          SET state            = 'leased',
+              lease_expires_at = now() + $3,
+              leased_by        = $2,
+              updated_at       = now()
+          WHERE id IN (
+              SELECT id FROM jobs
+              WHERE state = 'pending'
+              ORDER BY created_at, id
+              LIMIT $1
+              FOR UPDATE SKIP LOCKED
+          )
+          RETURNING id, type, payload, state, attempt, created_at, updated_at
+      ), logged AS (
+          INSERT INTO job_events (job_id, state, message)
+          SELECT id, state, 'leased by ' || $2 FROM leased
+      )
+      SELECT * FROM leased`
+
+// Lease claims up to n jobs that are ready to run, marks them leased by
+// leasedBy for the given duration, and returns them.
+// It returns an empty slice when no work is available.
+//
+// Unlike the single-row paths, Lease does not call job.Transition: the
+// transition is enforced by the query's WHERE state = 'pending' clause,
+// which the database checks per row while holding the lock. Validating in Go
+// first would be a check on stale data, since any row can change between the
+// check and the UPDATE.
+func (s *Store) Lease(ctx context.Context, leasedBy string, n int, d time.Duration) ([]job.Job, error) {
+	if n <= 0 {
+		n = DefaultLimit
+	}
+	rows, err := s.pool.Query(ctx, leaseJobSQL, n, leasedBy, d)
+	if err != nil {
+		return nil, fmt.Errorf("query jobs leased by %s: %w", leasedBy, err)
+	}
+	jobs, err := pgx.CollectRows(rows, pgx.RowToStructByName[job.Job])
+	if err != nil {
+		return nil, fmt.Errorf("collect jobs leased by %s: %w", leasedBy, err)
+	}
+	return jobs, nil
+}

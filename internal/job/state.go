@@ -32,6 +32,10 @@ func (s State) Terminal() bool {
 	return len(transitions[s]) == 0
 }
 
+// transitions is the only description of the lifecycle in Go, but not the
+// only one that exists: set-based SQL in the store encodes some edges
+// directly, because a statement that updates many rows at once cannot call
+// Transition per row. Changing this table means grepping the SQL as well.
 var transitions = map[State][]State{
 	Pending: {Leased},
 	Leased:  {Succeeded, Failed, Pending},
