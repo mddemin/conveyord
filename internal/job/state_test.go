@@ -18,7 +18,6 @@ func TestStateTerminal(t *testing.T) {
 	}{
 		{Pending, false},
 		{Leased, false},
-		{Failed, false},
 		{Succeeded, true},
 		{Dead, true},
 	}
@@ -36,10 +35,7 @@ func TestTransitionAllowed(t *testing.T) {
 	allowed := []struct{ from, to State }{
 		{Pending, Leased},
 		{Leased, Succeeded},
-		{Leased, Failed},
 		{Leased, Pending},
-		{Failed, Pending},
-		{Failed, Dead},
 	}
 
 	for _, tt := range allowed {
@@ -52,11 +48,10 @@ func TestTransitionAllowed(t *testing.T) {
 }
 
 func TestTransitionRejectsEverythingElse(t *testing.T) {
-	all := []State{Pending, Leased, Succeeded, Failed, Dead}
+	all := []State{Pending, Leased, Succeeded, Dead}
 	legal := map[State]map[State]bool{
 		Pending: {Leased: true},
-		Leased:  {Succeeded: true, Failed: true, Pending: true},
-		Failed:  {Pending: true, Dead: true},
+		Leased:  {Succeeded: true, Pending: true, Dead: true},
 	}
 
 	for _, from := range all {

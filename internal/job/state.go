@@ -12,14 +12,14 @@ import (
 type State string
 
 // The states a job can occupy. A job is created Pending, is Leased to an
-// agent, and ends Succeeded or Dead. Failed is transient: the retry policy
-// moves it back to Pending or on to Dead.
+// agent, and ends Succeeded or Dead. A failed attempt is not a state: the
+// retry policy sends the job straight back to Pending or on to Dead.
 const (
 	Pending   State = "pending"
 	Leased    State = "leased"
 	Succeeded State = "succeeded"
-	Failed    State = "failed"
-	Dead      State = "dead"
+
+	Dead State = "dead"
 )
 
 // String returns the state's wire representation.
@@ -38,8 +38,7 @@ func (s State) Terminal() bool {
 // Transition per row. Changing this table means grepping the SQL as well.
 var transitions = map[State][]State{
 	Pending: {Leased},
-	Leased:  {Succeeded, Failed, Pending},
-	Failed:  {Pending, Dead},
+	Leased:  {Succeeded, Pending, Dead},
 }
 
 // Transition returns ErrInvalidTransition if transition to next state is not possible.

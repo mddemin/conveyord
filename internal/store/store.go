@@ -30,8 +30,8 @@ const insertJobSQL = `
       RETURNING created_at, updated_at`
 
 const insertJobEventSQL = `
-      INSERT INTO job_events (job_id, state)
-      VALUES ($1, $2)`
+      INSERT INTO job_events (job_id, state, message)
+      VALUES ($1, $2, $3)`
 
 // Enqueue inserts j as a new pending job and fills in its
 // State, Attempt, CreatedAt and UpdatedAt from the stored row.
@@ -56,7 +56,7 @@ func (s *Store) Enqueue(ctx context.Context, j *job.Job) error {
 		j.Attempt = 0
 		j.State = job.Pending
 
-		_, err = tx.Exec(ctx, insertJobEventSQL, j.ID, j.State)
+		_, err = tx.Exec(ctx, insertJobEventSQL, j.ID, j.State, "")
 		if err != nil {
 			return fmt.Errorf("recording enqueue event for job %s: %w", j.ID, err)
 		}
@@ -174,7 +174,7 @@ const leaseJobSQL = `
               updated_at       = now()
           WHERE id IN (
               SELECT id FROM jobs
-              WHERE state = 'pending'
+              WHERE state = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= now())
               ORDER BY created_at, id
               LIMIT $1
               FOR UPDATE SKIP LOCKED
@@ -248,8 +248,8 @@ const completeJobSQL = `
 
 // Complete moves a leased job to a terminal state and records an event.
 // state must be terminal and reachable from job.Leased, which today means
-// job.Succeeded. Burial goes through Fail, which reaches job.Dead by way of
-// job.Failed so the retry policy gets a say.
+// job.Succeeded. Burial goes through Fail instead, so the retry policy gets a
+// say before a job reaches job.Dead.
 func (s *Store) Complete(ctx context.Context, id, leasedBy string, state job.State, message string) error {
 	err := job.Transition(job.Leased, state)
 	if err != nil {
@@ -304,4 +304,63 @@ func (s *Store) ReapExpired(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("reaping jobs: %w", err)
 	}
 	return reaped, nil
+}
+
+const getFailedJobSQL = `
+      SELECT id, type, payload, state, attempt, created_at, updated_at
+      FROM jobs
+      WHERE id = $1 AND leased_by = $2 AND state = 'leased'
+      FOR UPDATE`
+
+const updateFailedJobSQL = `
+      UPDATE jobs
+      SET state            = $1,
+          attempt          = $2,
+          next_attempt_at  = $3,
+          leased_by        = NULL,
+          lease_expires_at = NULL,
+          updated_at       = now()
+      WHERE id = $4`
+
+// Fail applies p to a failed attempt on a leased job: it increments the
+// attempt count, then either schedules a retry or dead-letters the job.
+// It returns the decision that was applied.
+// cause must be non-nil; Fail returns ErrEmptyCause otherwise.
+func (s *Store) Fail(ctx context.Context, id, leasedBy string, cause error, p job.Policy) (job.Decision, error) {
+	var d job.Decision
+	if cause == nil {
+		return d, fmt.Errorf("job %s: %w", id, ErrEmptyCause)
+	}
+
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		var j job.Job
+		err := tx.QueryRow(ctx,
+			getFailedJobSQL, id, leasedBy).Scan(&j.ID, &j.Type, &j.Payload, &j.State, &j.Attempt, &j.CreatedAt, &j.UpdatedAt)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("%w: %s", job.ErrNotFound, id)
+			}
+			return fmt.Errorf("getting failed job %s leased by %s: %w", id, leasedBy, err)
+		}
+		j.Attempt++
+		d = p.OnFailure(&j, cause)
+
+		nextAttempt := &d.NextAttemptAt
+		if d.NextAttemptAt.IsZero() {
+			nextAttempt = nil
+		}
+
+		_, err = tx.Exec(ctx, updateFailedJobSQL, d.State, j.Attempt, nextAttempt, id)
+		if err != nil {
+			return fmt.Errorf("updating failed job %s leased by %s: %w", id, leasedBy, err)
+		}
+
+		_, err = tx.Exec(ctx, insertJobEventSQL, j.ID, d.State, cause.Error())
+		if err != nil {
+			return fmt.Errorf("recording failed event for job %s: %w", j.ID, err)
+		}
+
+		return nil
+	})
+	return d, err
 }

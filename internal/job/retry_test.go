@@ -142,7 +142,7 @@ func TestOnFailure(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			j := &Job{ID: "j1", State: Failed, Attempt: tt.attempt}
+			j := &Job{ID: "j1", State: Leased, Attempt: tt.attempt}
 
 			got := p.OnFailure(j, tt.cause)
 			if got != tt.want {
@@ -154,7 +154,7 @@ func TestOnFailure(t *testing.T) {
 
 func TestOnFailureDoesNotMutateTheJob(t *testing.T) {
 	p := Policy{Base: time.Second, Max: time.Minute, MaxAttempts: 3, Jitter: noJitter}
-	j := &Job{ID: "j1", State: Failed, Attempt: 1}
+	j := &Job{ID: "j1", State: Leased, Attempt: 1}
 	before := *j
 
 	p.OnFailure(j, errors.New("boom"))
@@ -166,17 +166,17 @@ func TestOnFailureDoesNotMutateTheJob(t *testing.T) {
 
 func TestOnFailureDecisionIsAppliable(t *testing.T) {
 	p := Policy{Base: time.Second, Max: time.Minute, MaxAttempts: 3, Jitter: noJitter}
-	j := &Job{ID: "j1", State: Failed, Attempt: 1}
+	j := &Job{ID: "j1", State: Leased, Attempt: 1}
 
 	d := p.OnFailure(j, errors.New("boom"))
 	if err := j.To(d.State); err != nil {
-		t.Fatalf("applying decision %s to a Failed job: %v", d.State, err)
+		t.Fatalf("applying decision %s to a Leased job: %v", d.State, err)
 	}
 }
 
 func TestOnFailureMaxAttemptsZero(t *testing.T) {
 	p := Policy{Base: time.Second, Max: time.Minute, MaxAttempts: 0, Jitter: noJitter}
-	j := &Job{ID: "j1", State: Failed, Attempt: 1}
+	j := &Job{ID: "j1", State: Leased, Attempt: 1}
 
 	d := p.OnFailure(j, errors.New("boom"))
 	if d.State != Pending {
