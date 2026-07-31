@@ -47,7 +47,12 @@ github.com/testcontainers/testcontainers-go/modules/postgres
 
 ### Steps
 
-1. `go get github.com/jackc/pgx/v5github.com/testcontainers/testcontainers-go github.com/testcontainers/testcontainers-go/modules/postgres`
+1. Fetch the dependencies:
+   ```bash
+   go get github.com/jackc/pgx/v5
+   go get github.com/testcontainers/testcontainers-go
+   go get github.com/testcontainers/testcontainers-go/modules/postgres
+   ```
 2. Create `internal/store/main_test.go`.
 3. Get `TestPoolIsAlive` passing.
 4. `go test -short ./...` → the store package reports `[no tests to run]` or skips, and finishes instantly.
@@ -60,6 +65,7 @@ package store
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"testing"
@@ -76,6 +82,10 @@ import (
 var testPool *pgxpool.Pool
 
 func TestMain(m *testing.M) {
+	// m.Run parses the test flags, so -short is not readable until we do it
+	// ourselves. testing.Short() before this line panics.
+	flag.Parse()
+
 	if testing.Short() {
 		os.Exit(m.Run())
 	}
@@ -257,19 +267,25 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	}
 	ctx := t.Context()
 
+	countApplied := func() int {
+		t.Helper()
+		var n int
+		if err := testPool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&n); err != nil {
+			t.Fatalf("counting migrations: %v", err)
+		}
+		return n
+	}
+
 	if err := Migrate(ctx, testPool); err != nil {
 		t.Fatalf("first Migrate: %v", err)
 	}
+	want := countApplied()
+
 	if err := Migrate(ctx, testPool); err != nil {
 		t.Fatalf("second Migrate: %v", err)
 	}
-
-	var applied int
-	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&applied); err != nil {
-		t.Fatalf("counting migrations: %v", err)
-	}
-	if applied != 1 {
-		t.Errorf("schema_migrations has %d rows after two runs, want 1", applied)
+	if got := countApplied(); got != want {
+		t.Errorf("schema_migrations has %d rows after a second run, want %d", got, want)
 	}
 }
 ```
