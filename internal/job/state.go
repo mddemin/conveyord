@@ -32,6 +32,15 @@ func (s State) Terminal() bool {
 	return len(transitions[s]) == 0
 }
 
+// Valid reports whether s is a state a job can occupy.
+func (s State) Valid() bool {
+	switch s {
+	case Pending, Leased, Succeeded, Dead:
+		return true
+	}
+	return false
+}
+
 // transitions is the only description of the lifecycle in Go, but not the
 // only one that exists: set-based SQL in the store encodes some edges
 // directly, because a statement that updates many rows at once cannot call

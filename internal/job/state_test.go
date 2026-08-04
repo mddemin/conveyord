@@ -68,3 +68,16 @@ func TestTransitionRejectsEverythingElse(t *testing.T) {
 		}
 	}
 }
+
+func TestStateValid(t *testing.T) {
+	for _, s := range []State{Pending, Leased, Succeeded, Dead} {
+		if !s.Valid() {
+			t.Errorf("%s is a declared state but Valid() says otherwise", s)
+		}
+	}
+	for _, s := range []State{"", "failed", "pnding", "PENDING"} {
+		if s.Valid() {
+			t.Errorf("%q is not a state but Valid() accepts it", s)
+		}
+	}
+}
