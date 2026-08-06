@@ -1,20 +1,22 @@
 package store
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/mddemin/conveyor/internal/pgtest"
+)
 
 func TestMigrateCreatesSchema(t *testing.T) {
-	if testing.Short() {
-		t.Skip("integration test")
-	}
+	pool := pgtest.Pool(t)
 	ctx := t.Context()
 
-	if err := Migrate(ctx, testPool); err != nil {
+	if err := Migrate(ctx, pool); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
 
 	for _, table := range []string{"jobs", "job_events", "schema_migrations"} {
 		var exists bool
-		err := testPool.QueryRow(ctx,
+		err := pool.QueryRow(ctx,
 			`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)`,
 			table).Scan(&exists)
 		if err != nil {
@@ -27,26 +29,24 @@ func TestMigrateCreatesSchema(t *testing.T) {
 }
 
 func TestMigrateIsIdempotent(t *testing.T) {
-	if testing.Short() {
-		t.Skip("integration test")
-	}
+	pool := pgtest.Pool(t)
 	ctx := t.Context()
 
 	countApplied := func() int {
 		t.Helper()
 		var n int
-		if err := testPool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&n); err != nil {
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&n); err != nil {
 			t.Fatalf("counting migrations: %v", err)
 		}
 		return n
 	}
 
-	if err := Migrate(ctx, testPool); err != nil {
+	if err := Migrate(ctx, pool); err != nil {
 		t.Fatalf("first Migrate: %v", err)
 	}
 	want := countApplied()
 
-	if err := Migrate(ctx, testPool); err != nil {
+	if err := Migrate(ctx, pool); err != nil {
 		t.Fatalf("second Migrate: %v", err)
 	}
 	if got := countApplied(); got != want {

@@ -1,3 +1,25 @@
+// Package httpapi serves the job API over HTTP.
+//
+// [New] returns an [API], which is an http.Handler with routing and middleware
+// already assembled; binding it to a port belongs to the caller. It depends on
+// storage through the [Store] interface declared here rather than on any
+// concrete type, so a test can substitute a stub and the package never imports
+// a database driver.
+//
+// Every response this package generates is JSON. Success bodies are a job or a
+// list of jobs; every failure is an object with a single "error" field,
+// produced in exactly one place — writeError, which owns the mapping from
+// domain and storage errors to status codes. A 5xx never carries the underlying
+// error to the client, only to the log.
+//
+// Two responses come from net/http instead and do not follow that shape: an
+// unrouted path or an unsupported method gets ServeMux's plain-text 404 or 405,
+// and http.TimeoutHandler's 503 carries a JSON body under a sniffed
+// text/plain content type.
+//
+// Each request is assigned or inherits an X-Request-ID, echoed on the response
+// and attached to every log line it produces, so a client-visible identifier
+// and the server's own record of what happened can be joined.
 package httpapi
 
 import (
