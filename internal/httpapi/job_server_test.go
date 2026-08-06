@@ -26,6 +26,11 @@ func (s stubStore) List(ctx context.Context, f store.Filter) ([]job.Job, error) 
 	return s.list(ctx, f)
 }
 
+// emptyList succeeds with no jobs. It is what the middleware tests want: a
+// route that reaches a handler and returns, where the handler itself is beside
+// the point.
+func emptyList(context.Context, store.Filter) ([]job.Job, error) { return nil, nil }
+
 // do runs one request through the API's full routing and middleware and
 // returns what the client would have seen.
 func do(a *API, method, path, body string) *httptest.ResponseRecorder {

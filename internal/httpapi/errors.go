@@ -29,11 +29,11 @@ func (a *API) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	// carry table names, constraint names, and connection strings.
 	msg := err.Error()
 	if status >= http.StatusInternalServerError {
-		a.log.Error("request failed", "err", err, "method", r.Method, "path", r.URL.Path)
+		a.logger(r.Context()).Error("request failed", "err", err, "method", r.Method, "path", r.URL.Path)
 		msg = "internal error"
 	}
 
 	if err := writeJSON(w, status, errorResponse{Error: msg}); err != nil {
-		a.log.Error("writing error response", "err", err)
+		a.logger(r.Context()).Error("writing error response", "err", err)
 	}
 }

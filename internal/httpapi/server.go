@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/mddemin/conveyor/internal/job"
 	"github.com/mddemin/conveyor/internal/store"
@@ -19,6 +20,8 @@ type Store interface {
 	Get(ctx context.Context, id string) (*job.Job, error)
 	List(ctx context.Context, f store.Filter) ([]job.Job, error)
 }
+
+const requestTimeout = time.Minute
 
 // API serves the job API. It is an http.Handler; binding it to a port is
 // the caller's job.
@@ -36,7 +39,9 @@ func New(store Store, log *slog.Logger) *API {
 		log = slog.Default()
 	}
 	a := &API{store: store, log: log}
-	a.handler = a.routes()
+	// Invert logging and recover and every 500 disappears from the access log
+	// invert logging and request id and request id disappears from logs
+	a.handler = chain(a.routes(), a.withRequestID, a.withLogging, a.withRecover)
 	return a
 }
 
@@ -72,7 +77,7 @@ func (a *API) enqueue(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Location", "/jobs/"+j.ID)
 	if err := writeJSON(w, http.StatusCreated, toResponse(j)); err != nil {
-		a.log.Error("writing response", "err", err, "method", r.Method, "path", r.URL.Path)
+		a.logger(r.Context()).Error("writing response", "err", err, "method", r.Method, "path", r.URL.Path)
 	}
 }
 
@@ -85,7 +90,7 @@ func (a *API) get(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := writeJSON(w, http.StatusOK, toResponse(j)); err != nil {
-		a.log.Error("writing response", "err", err, "method", r.Method, "path", r.URL.Path)
+		a.logger(r.Context()).Error("writing response", "err", err, "method", r.Method, "path", r.URL.Path)
 	}
 }
 
@@ -120,14 +125,20 @@ func (a *API) list(w http.ResponseWriter, r *http.Request) {
 		out = append(out, toResponse(&jobs[i]))
 	}
 	if err := writeJSON(w, http.StatusOK, out); err != nil {
-		a.log.Error("writing response", "err", err, "method", r.Method, "path", r.URL.Path)
+		a.logger(r.Context()).Error("writing response", "err", err, "method", r.Method, "path", r.URL.Path)
 	}
 }
 
 func (a *API) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /jobs", a.enqueue)
-	mux.HandleFunc("GET /jobs/{id}", a.get)
-	mux.HandleFunc("GET /jobs", a.list)
+
+	// Timeout is per-route, not global: http.TimeoutHandler buffers the whole
+	// response, and a buffered stream never streams. Phase 6's SSE route
+	// registers with mux.HandleFunc instead, deliberately unwrapped.
+	timed := func(h http.HandlerFunc) http.Handler { return a.withTimeout(requestTimeout, h) }
+
+	mux.Handle("POST /jobs", timed(a.enqueue))
+	mux.Handle("GET /jobs/{id}", timed(a.get))
+	mux.Handle("GET /jobs", timed(a.list))
 	return mux
 }
