@@ -132,15 +132,6 @@ func (s *Store) List(ctx context.Context, f Filter) ([]job.Job, error) {
 	return jobs, nil
 }
 
-// Event is one recorded step in a job's lifecycle.
-// Lives here while storage is the only consumer; revisit if transports need it.
-type Event struct {
-	JobID     string
-	State     job.State
-	Message   string
-	CreatedAt time.Time
-}
-
 const listJobEventsSQL = `
       SELECT job_id, state, message, created_at
       FROM job_events
@@ -149,12 +140,12 @@ const listJobEventsSQL = `
       LIMIT $2`
 
 // Events returns up to DefaultLimit events for a job, oldest first.
-func (s *Store) Events(ctx context.Context, jobID string) ([]Event, error) {
+func (s *Store) Events(ctx context.Context, jobID string) ([]job.Event, error) {
 	rows, err := s.pool.Query(ctx, listJobEventsSQL, jobID, DefaultLimit)
 	if err != nil {
 		return nil, fmt.Errorf("events for job %s: %w", jobID, err)
 	}
-	events, err := pgx.CollectRows(rows, pgx.RowToStructByName[Event])
+	events, err := pgx.CollectRows(rows, pgx.RowToStructByName[job.Event])
 	if err != nil {
 		return nil, fmt.Errorf("events for job %s: %w", jobID, err)
 	}

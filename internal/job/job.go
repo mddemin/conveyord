@@ -24,3 +24,11 @@ func (j *Job) To(next State) error {
 	j.State = next
 	return nil
 }
+
+// Event is one recorded step in a job's lifecycle.
+type Event struct {
+	JobID     string
+	State     State
+	Message   string
+	CreatedAt time.Time
+}
