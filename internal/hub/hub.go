@@ -2,6 +2,7 @@ package hub
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/mddemin/conveyor/internal/job"
 )
@@ -19,42 +20,52 @@ type Hub struct {
 	// Keyed by subscription ID, not job ID: two clients may watch the same job,
 	// and /events subscribers have no job at all. Publish scans every subscriber;
 	// fine at this scale, index by job if the subscriber count reaches thousands.
-	subs map[int]*sub
-}
-
-type sub struct {
-	jobID string // "" = everything
-	ch    chan job.Event
+	subs map[int]*Subscription
 }
 
 func New() *Hub {
-	return &Hub{subs: make(map[int]*sub)}
+	return &Hub{subs: make(map[int]*Subscription)}
 }
 
-// Subscribe returns a channel of events and a function that stops the
-// subscription. jobID filters to one job; "" receives every event.
-func (h *Hub) Subscribe(jobID string) (<-chan job.Event, func()) {
+type Subscription struct {
+	C <-chan job.Event
+
+	hub    *Hub           // set by Subscribe; how Close finds the map
+	id     int            // this subscription's key in that map
+	ch     chan job.Event // the send side of C, for Publish
+	jobID  string
+	closed bool
+
+	lagged atomic.Bool
+}
+
+func (s *Subscription) Lagged() bool {
+	return s.lagged.Swap(false)
+}
+
+// Close ends the subscription and closes C. Safe to call more than once.
+func (s *Subscription) Close() {
+	s.hub.mu.Lock()
+	defer s.hub.mu.Unlock()
+
+	if s.closed {
+		return
+	}
+	s.closed = true
+	delete(s.hub.subs, s.id)
+	close(s.ch)
+}
+
+func (h *Hub) Subscribe(jobID string) *Subscription {
 	ch := make(chan job.Event, bufferSize)
+	s := &Subscription{C: ch, ch: ch, hub: h, jobID: jobID}
 
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.nextID++
-	id := h.nextID
-	h.subs[id] = &sub{jobID: jobID, ch: ch}
-	h.mu.Unlock()
-
-	// Cancel is a closure rather than an Unsubscribe(id) the caller has to
-	// remember: "defer cancel()" on the next line is the whole contract.
-	// It must tolerate repeated calls — the SSE handler defers it and phase 7
-	// will add a second caller — so the map lookup guards the close. Closing
-	// a channel twice panics; a missing key just means someone got here first.
-	return ch, func() {
-		h.mu.Lock()
-		defer h.mu.Unlock()
-		if s, ok := h.subs[id]; ok {
-			delete(h.subs, id)
-			close(s.ch)
-		}
-	}
+	s.id = h.nextID
+	h.subs[s.id] = s
+	return s
 }
 
 // Publish delivers ev to every matching subscriber. It never blocks: a
@@ -80,9 +91,7 @@ func (h *Hub) Publish(ev job.Event) {
 			select {
 			case s.ch <- ev:
 			default:
-				// TODO(phase 6 task 2): count this and mark the subscriber
-				// lagged. A discarded event nobody records is a gap the client
-				// cannot see and the operator cannot find.
+				s.lagged.Store(true)
 			}
 		}
 	}

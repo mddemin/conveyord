@@ -640,10 +640,11 @@ review.
 `Lagged()` clearing on read is deliberate: the handler emits one `event: lagged` frame per
 lag episode, not one per drop. It takes the write lock, since it mutates.
 
-Keep the per-subscriber counter alongside it — the flag says *that* you lagged, the counter
-says *how badly*, which is what goes in the log line when the subscription ends. Leave a
-`ponytail:` marker naming disconnect-above-threshold as the upgrade; it is better behaviour
-under real load and you have no load test yet to pick the threshold.
+A per-subscriber counter — *how badly* you lagged, next to the flag's *that* you lagged —
+belongs in Task 3, with the disconnect log line that reads it. Not here: nothing in this
+task can consume a number. Leave a `ponytail:` marker naming disconnect-above-threshold as
+the upgrade; it is better behaviour under real load and you have no load test yet to pick
+the threshold.
 
 One property of drop-newest worth knowing, because it is the reason doing nothing is not an
 option: the events most likely to be discarded are the *last* ones in a burst, and for a job
@@ -655,7 +656,9 @@ since a slice cannot appear in a `select`.
 ### Requirements
 
 - Non-blocking send, read lock held across the whole broadcast loop, with the comment explaining why both are required.
-- Per-subscriber drop counter and `lagged` flag, both fields on `sub`. Every access is already under `Hub.mu`, so plain `uint64`/`bool` — no `atomic` — but say so in a comment, because an unsynchronized-looking counter written from `Publish` will make the next reader stop and check.
+- One `lagged atomic.Bool` on the subscription. That is the whole of this task's bookkeeping — no drop counter yet. A count has no consumer until Task 3 has a log line to put it in, and a hub-wide total has none ever; add it there, in the same commit as the code that reads it.
+- `atomic`, not a plain field, and the reason is easy to miss: `Publish` writes it while holding the **read** lock, and several publishers can hold that at once, so two of them can write the same field concurrently. Do not reach for `Hub.mu` in the drop path either — `Publish` already holds it, and `sync.RWMutex` is not reentrant, so asking for `Lock()` there deadlocks on the first dropped event.
+- `Lagged()` clears as it reads. Use `Swap(false)`, not a load followed by a store — a drop landing between the two would be lost.
 - Hub-wide totals, if you want them, are a sum over the map under `RLock`. Do not keep a second counter on the `Hub`: two places to increment is two places to forget.
 - The buffer size constant gets a comment with the actual tradeoff: too small drops events during ordinary scheduling jitter; too large delays the client's discovery that it is behind and costs `size × subscribers × sizeof(Event)` bytes of steady-state memory.
 
@@ -763,15 +766,15 @@ func TestConcurrentUse(t *testing.T) {
 }
 ```
 
-`TestDropsAreCounted` reads the unexported `bufferSize` and `h.dropped()`, which is what
-being in `package hub` buys: the test computes "enough to overflow" from the real constant
-instead of hardcoding `1000`, which would silently stop testing anything the day the buffer
-grows.
+The lag tests read the unexported `bufferSize`, which is what being in `package hub` buys:
+they compute "enough to overflow" from the real constant instead of hardcoding `1000`, which
+would silently stop testing anything the day the buffer grows.
 
-`h.dropped()` here is a sum over live subscriptions, not a field. Note what that makes it: a
-*gauge*, not a monotonic counter — cancel a subscriber and its drops leave the total. Fine
-for a test and for `/healthz`; wrong the day you point Prometheus at it. Write that down
-next to the method rather than discovering it from a graph.
+Note there is no `TestDropsAreCounted`. An earlier draft of this plan had one, calling an
+`h.dropped()` that summed a per-subscriber counter — and that method existed only because
+the test called it. `TestLaggedIsSetByADropAndClearsOnRead` proves the same overflow is
+detected, from the same setup, through the API something real actually uses. When the only
+caller of a method is a test, delete the method and find the test's assertion elsewhere.
 
 Run this task's tests with `-race -count=5`. If any of them is flaky, the design is wrong;
 do not "fix" it by widening a timeout.
