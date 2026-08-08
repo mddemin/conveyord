@@ -77,7 +77,7 @@ func (a *API) events(w http.ResponseWriter, r *http.Request, jobFilter string) {
 				_ = rc.Flush()
 			}
 
-			if err := writeEvent(w, "job", ev); err != nil {
+			if err := writeEvent(w, "job", toEventResponse(ev)); err != nil {
 				return // the client is gone; the deferred Close frees its slot
 			}
 			// Errors are ignored from here on: the first Flush already proved

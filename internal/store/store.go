@@ -16,13 +16,40 @@ const uniqueViolation = "23505"
 
 // Store persists jobs in Postgres. It is safe for concurrent use.
 type Store struct {
-	pool *pgxpool.Pool
+	pool   *pgxpool.Pool
+	events Publisher
 }
 
-// New returns a Store backed by pool. The caller owns the pool and must close it.
-func New(pool *pgxpool.Pool) *Store {
-	return &Store{pool: pool}
+// New returns a Store backed by pool, publishing every state change it
+// commits to events. The caller owns the pool and must close it. A nil events
+// discards them, so a wiring mistake costs the live stream rather than every
+// write.
+func New(pool *pgxpool.Pool, events Publisher) *Store {
+	if events == nil {
+		events = nopPublisher{}
+	}
+	return &Store{pool: pool, events: events}
 }
+
+// Publisher receives a job.Event for every state change this package commits.
+// Declared here rather than imported so storage depends on the behaviour it
+// needs and not on whatever provides it: internal/hub satisfies this today,
+// and a Postgres LISTEN/NOTIFY publisher could satisfy it tomorrow without
+// this package changing.
+//
+// Implementations must not block. Every call happens on the goroutine that
+// performed the write, after its transaction has committed, and a slow
+// Publish would slow down enqueueing and leasing.
+type Publisher interface {
+	Publish(ev job.Event)
+}
+
+// nopPublisher discards events. It is what a Store gets when the caller
+// passes no publisher, so a wiring mistake means no stream rather than a
+// panic on the first write.
+type nopPublisher struct{}
+
+func (nopPublisher) Publish(job.Event) {}
 
 const insertJobSQL = `
       INSERT INTO jobs (id, type, payload, state)
@@ -31,11 +58,13 @@ const insertJobSQL = `
 
 const insertJobEventSQL = `
       INSERT INTO job_events (job_id, state, message)
-      VALUES ($1, $2, $3)`
+      VALUES ($1, $2, $3)
+      RETURNING created_at`
 
 // Enqueue inserts j as a new pending job and fills in its
 // State, Attempt, CreatedAt and UpdatedAt from the stored row.
 func (s *Store) Enqueue(ctx context.Context, j *job.Job) error {
+	var ev job.Event
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		payload := j.Payload
 		if payload == nil {
@@ -56,14 +85,23 @@ func (s *Store) Enqueue(ctx context.Context, j *job.Job) error {
 		j.Attempt = 0
 		j.State = job.Pending
 
-		_, err = tx.Exec(ctx, insertJobEventSQL, j.ID, j.State, "")
+		// The event is read back from the row rather than assembled here, so
+		// its CreatedAt is the database's timestamp and matches the history
+		// GET /jobs/{id}/events will later serve.
+		ev = job.Event{JobID: j.ID, State: j.State}
+		err = tx.QueryRow(ctx, insertJobEventSQL, j.ID, j.State, ev.Message).Scan(&ev.CreatedAt)
 		if err != nil {
 			return fmt.Errorf("recording enqueue event for job %s: %w", j.ID, err)
 		}
-
 		return nil
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	// Published after the transaction, never inside it: a subscriber told
+	// about a write that then rolls back cannot be untold.
+	s.events.Publish(ev)
+	return nil
 }
 
 const getJobSQL = `
@@ -198,6 +236,21 @@ func (s *Store) Lease(ctx context.Context, leasedBy string, n int, d time.Durati
 	if err != nil {
 		return nil, fmt.Errorf("collect jobs leased by %s: %w", leasedBy, err)
 	}
+	// One event per job: a batch lease is n state changes, and subscribers are
+	// watching individual jobs. Publishing n times in a row is safe because a
+	// Publisher must not block; see the interface's contract.
+	//
+	// CreatedAt comes from the job's UpdatedAt rather than from the job_events
+	// row. They are the same instant, not an approximation: now() is the
+	// transaction timestamp, and one statement wrote both.
+	for i := range jobs {
+		s.events.Publish(job.Event{
+			JobID:     jobs[i].ID,
+			State:     jobs[i].State, // 'leased', set by the UPDATE
+			Message:   "leased by " + leasedBy,
+			CreatedAt: jobs[i].UpdatedAt,
+		})
+	}
 	return jobs, nil
 }
 
@@ -230,7 +283,7 @@ const completeJobSQL = `
               leased_by        = NULL,
               updated_at       = now()
           WHERE id = $1 AND leased_by = $2 AND state = 'leased'
-          RETURNING id, state
+          RETURNING id, state, updated_at
       ), logged AS (
           INSERT INTO job_events (job_id, state, message)
           SELECT id, state, $3 FROM leased
@@ -249,16 +302,24 @@ func (s *Store) Complete(ctx context.Context, id, leasedBy string, state job.Sta
 	if !state.Terminal() {
 		return fmt.Errorf("completing job %s: %s is not terminal", id, state)
 	}
-	ct, err := s.pool.Exec(ctx, completeJobSQL, id, leasedBy, message, state)
+	ev := job.Event{Message: message}
+	err = s.pool.QueryRow(ctx, completeJobSQL, id, leasedBy, message, state).
+		Scan(&ev.JobID, &ev.State, &ev.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("%w: %s", job.ErrNotFound, id)
+	}
 	if err != nil {
 		return fmt.Errorf("completing job %s leased by %s: %w", id, leasedBy, err)
 	}
-	if ct.RowsAffected() != 1 {
-		return fmt.Errorf("%w: %s", job.ErrNotFound, id)
-	}
+	s.events.Publish(ev)
 	return nil
 }
 
+// Nothing selects from reaped, which is not a mistake: Postgres runs a
+// data-modifying CTE exactly once whether or not the primary query reads its
+// output, so the UPDATE happens either way. The query returns the job_events
+// rows instead, because those are what gets published.
+//
 // logged reads from expired, not reaped: by the time the UPDATE's RETURNING
 // runs, leased_by is already NULL, and the dead agent's name survives only in
 // the rows the first CTE locked.
@@ -277,24 +338,30 @@ const reapExpiredSQL = `
               updated_at       = now()
           FROM expired
           WHERE jobs.id = expired.id
-          RETURNING jobs.id
       ), logged AS (
           INSERT INTO job_events (job_id, state, message)
           SELECT id, 'pending', 'reaped, was leased by ' || leased_by FROM expired
+          RETURNING job_id, state, message, created_at
       )
-      SELECT count(*) FROM reaped`
+      SELECT job_id, state, message, created_at FROM logged`
 
 // ReapExpired returns jobs whose lease has expired to the pending state and
 // records an event for each. It returns the number of jobs reaped, at most
 // DefaultLimit per call — a backlog drains over several ticks rather than in
 // one long transaction.
 func (s *Store) ReapExpired(ctx context.Context) (int, error) {
-	var reaped int
-	err := s.pool.QueryRow(ctx, reapExpiredSQL, DefaultLimit).Scan(&reaped)
+	rows, err := s.pool.Query(ctx, reapExpiredSQL, DefaultLimit)
 	if err != nil {
 		return 0, fmt.Errorf("reaping jobs: %w", err)
 	}
-	return reaped, nil
+	events, err := pgx.CollectRows(rows, pgx.RowToStructByName[job.Event])
+	if err != nil {
+		return 0, fmt.Errorf("collecting reaped jobs: %w", err)
+	}
+	for _, ev := range events {
+		s.events.Publish(ev)
+	}
+	return len(events), nil
 }
 
 const getFailedJobSQL = `
@@ -322,6 +389,7 @@ func (s *Store) Fail(ctx context.Context, id, leasedBy string, cause error, p jo
 	if cause == nil {
 		return d, fmt.Errorf("job %s: %w", id, ErrEmptyCause)
 	}
+	var ev job.Event
 
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		var j job.Job
@@ -346,12 +414,20 @@ func (s *Store) Fail(ctx context.Context, id, leasedBy string, cause error, p jo
 			return fmt.Errorf("updating failed job %s leased by %s: %w", id, leasedBy, err)
 		}
 
-		_, err = tx.Exec(ctx, insertJobEventSQL, j.ID, d.State, cause.Error())
+		message := cause.Error()
+		ev = job.Event{JobID: j.ID, State: d.State, Message: message}
+
+		err = tx.QueryRow(ctx, insertJobEventSQL, j.ID, d.State, message).Scan(&ev.CreatedAt)
 		if err != nil {
 			return fmt.Errorf("recording failed event for job %s: %w", j.ID, err)
 		}
 
 		return nil
 	})
-	return d, err
+	if err != nil {
+		return d, err
+	}
+
+	s.events.Publish(ev)
+	return d, nil
 }

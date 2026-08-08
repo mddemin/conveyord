@@ -123,6 +123,8 @@ func TestASubscriberThatNeverReadsCannotBlockPublish(t *testing.T) {
 	defer s.Close()
 
 	done := make(chan struct{})
+	// Exits after 10,000 publishes; the select below waits for it, and the
+	// test fails rather than leaking it if a publish ever blocks.
 	go func() {
 		defer close(done)
 		for i := 0; i < 10_000; i++ {
@@ -147,6 +149,10 @@ func TestASlowSubscriberDoesNotStarveAFastOne(t *testing.T) {
 	defer fast.Close()
 
 	const n = 1000
+	// Exits after n publishes. Nothing waits for it: the assertion is that the
+	// fast subscriber keeps receiving while it runs, and Publish on a hub
+	// whose subscriptions have been closed is a no-op, so an overrun past the
+	// end of the test is harmless.
 	go func() {
 		for i := 0; i < n; i++ {
 			h.Publish(job.Event{JobID: "j1", State: job.Pending})
@@ -214,6 +220,8 @@ func TestConcurrentUse(t *testing.T) {
 	h := New()
 	var wg sync.WaitGroup
 
+	// Both groups exit after a fixed number of iterations, and wg.Wait below
+	// blocks until every one of them has.
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go func() {

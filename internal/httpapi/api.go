@@ -30,6 +30,16 @@ type jobResponse struct {
 	UpdatedAt time.Time       `json:"updated_at"`
 }
 
+// eventResponse is one lifecycle event as clients see it, and for the same
+// reason as jobResponse: job.Event is a domain type, and renaming one of its
+// fields must not silently change what is on the wire.
+type eventResponse struct {
+	JobID     string    `json:"job_id"`
+	State     string    `json:"state"`
+	Message   string    `json:"message,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 // errorResponse is the body of every 4xx and 5xx.
 type errorResponse struct {
 	Error     string `json:"error"`
@@ -47,6 +57,17 @@ func toResponse(j *job.Job) jobResponse {
 		Attempt:   j.Attempt,
 		CreatedAt: j.CreatedAt,
 		UpdatedAt: j.UpdatedAt,
+	}
+}
+
+// toEventResponse converts a domain event to its wire form, the one place the
+// event stream's JSON contract is defined.
+func toEventResponse(ev job.Event) eventResponse {
+	return eventResponse{
+		JobID:     ev.JobID,
+		State:     ev.State.String(),
+		Message:   ev.Message,
+		CreatedAt: ev.CreatedAt,
 	}
 }
 

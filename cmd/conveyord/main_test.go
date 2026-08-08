@@ -20,7 +20,10 @@ import (
 
 func TestMain(m *testing.M) { os.Exit(pgtest.Run(m)) }
 
-func freshDB(t *testing.T) *store.Store {
+// freshDB returns a Store publishing to events. The hub is a parameter rather
+// than an internal detail because the end-to-end tests need the same hub the
+// API subscribes to — one hub per process is the wiring main does.
+func freshDB(t *testing.T, events store.Publisher) *store.Store {
 	t.Helper()
 	pool := pgtest.Pool(t)
 
@@ -31,7 +34,7 @@ func freshDB(t *testing.T) *store.Store {
 	if _, err := pool.Exec(ctx, `TRUNCATE jobs, job_events RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
-	return store.New(pool)
+	return store.New(pool, events)
 }
 
 // The subset of the wire format this test asserts on. Deliberately a separate
@@ -44,7 +47,7 @@ type jobResponse struct {
 }
 
 func TestEnqueueAndReadBackOverHTTP(t *testing.T) {
-	s := freshDB(t) // the real *store.Store
+	s := freshDB(t, hub.New()) // the real *store.Store
 	api := httpapi.New(s, hub.New(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	ts := httptest.NewServer(api)
 	t.Cleanup(ts.Close)

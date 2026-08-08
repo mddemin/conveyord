@@ -105,6 +105,8 @@ func serveStream(t *testing.T, api *API, path string) (*streamRecorder, func()) 
 	ctx, cancel := context.WithCancel(context.Background())
 	w := newStreamRecorder()
 	done := make(chan struct{})
+	// Exits when the handler returns, which the returned stop function forces
+	// by cancelling the request context — and then waits for.
 	go func() {
 		defer close(done)
 		api.ServeHTTP(w, httptest.NewRequest("GET", path, nil).WithContext(ctx))
@@ -235,6 +237,8 @@ func TestALaggingClientIsToldToResync(t *testing.T) {
 	w.gate = make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	// Exits when the handler returns; the cancel and <-done at the end of the
+	// test make that happen and wait for it.
 	go func() {
 		defer close(done)
 		api.ServeHTTP(w, httptest.NewRequest("GET", "/events", nil).WithContext(ctx))

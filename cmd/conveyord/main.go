@@ -58,7 +58,7 @@ func run(log *slog.Logger) error {
 
 	hub := hub.New()
 
-	api := httpapi.New(store.New(pool), hub, log)
+	api := httpapi.New(store.New(pool, hub), hub, log)
 
 	srv := &http.Server{
 		Addr:              *addr,
