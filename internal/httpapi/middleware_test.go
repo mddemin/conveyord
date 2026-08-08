@@ -240,25 +240,29 @@ func TestRequestIsLoggedOnce(t *testing.T) {
 func TestFlusherSurvivesTheChainButNotATimeout(t *testing.T) {
 	api := newTestAPI(t, stubStore{})
 
-	seesFlusher := func(h func(http.Handler) http.Handler) bool {
-		var ok bool
+	// http.NewResponseController, not a w.(http.Flusher) assertion: recorder
+	// wraps the real writer, and any wrapper that declares Flush makes every
+	// writer underneath it look streamable. The controller walks Unwrap to the
+	// writer that actually decides, which is the only question worth asking.
+	canFlush := func(h func(http.Handler) http.Handler) bool {
+		var err error
 		probe := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			_, ok = w.(http.Flusher)
+			err = http.NewResponseController(w).Flush()
 		}))
 		if h != nil {
 			probe = h(probe)
 		}
 		c := chain(probe, api.withRequestID, api.withLogging, api.withRecover)
 		c.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x", nil))
-		return ok
+		return err == nil
 	}
 
-	if !seesFlusher(nil) {
-		t.Error("the middleware chain hides http.Flusher; SSE will not stream in phase 6")
+	if !canFlush(nil) {
+		t.Error("the middleware chain hides flushing; SSE will not stream")
 	}
 	timed := func(next http.Handler) http.Handler { return api.withTimeout(time.Minute, next) }
-	if seesFlusher(timed) {
-		t.Error("a timeout-wrapped route exposes http.Flusher; " +
-			"per-route timeouts were introduced on the premise that it does not")
+	if canFlush(timed) {
+		t.Error("a timeout-wrapped route can flush; " +
+			"per-route timeouts were introduced on the premise that it cannot")
 	}
 }

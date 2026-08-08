@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mddemin/conveyor/internal/httpapi"
+	"github.com/mddemin/conveyor/internal/hub"
 	"github.com/mddemin/conveyor/internal/store"
 )
 
@@ -55,7 +56,9 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("migrating: %w", err)
 	}
 
-	api := httpapi.New(store.New(pool), log)
+	hub := hub.New()
+
+	api := httpapi.New(store.New(pool), hub, log)
 
 	srv := &http.Server{
 		Addr:              *addr,

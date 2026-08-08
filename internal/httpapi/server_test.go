@@ -11,14 +11,27 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/mddemin/conveyor/internal/hub"
 	"github.com/mddemin/conveyor/internal/job"
 	"github.com/mddemin/conveyor/internal/store"
 )
 
 func newTestAPI(t *testing.T, store Store) *API {
 	t.Helper()
-	return New(store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return newTestAPIWithHub(t, store, hub.New())
+}
+
+// newTestAPIWithHub is for the stream tests, which need to publish into the
+// same hub the handler subscribes to. The heartbeat is squeezed down from 15
+// seconds so a test that waits for one finishes in milliseconds; a test nobody
+// runs guards nothing.
+func newTestAPIWithHub(t *testing.T, store Store, h *hub.Hub) *API {
+	t.Helper()
+	a := New(store, h, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	a.heartbeat = time.Millisecond
+	return a
 }
 
 // newTestAPIWithLogger keeps the log instead of discarding it, for the tests
@@ -27,7 +40,7 @@ func newTestAPI(t *testing.T, store Store) *API {
 func newTestAPIWithLogger(t *testing.T, store Store) (*API, *bytes.Buffer) {
 	t.Helper()
 	var buf bytes.Buffer
-	return New(store, slog.New(slog.NewJSONHandler(&buf, nil))), &buf
+	return New(store, hub.New(), slog.New(slog.NewJSONHandler(&buf, nil))), &buf
 }
 
 // A nil logger must not turn the first 500 into a panic — slog methods on a
@@ -35,7 +48,7 @@ func newTestAPIWithLogger(t *testing.T, store Store) (*API, *bytes.Buffer) {
 // mistake that would otherwise surface under load rather than at startup.
 // There is nothing to assert: the test is that this returns.
 func TestNewDefaultsTheLogger(t *testing.T) {
-	New(nil, nil).writeError(httptest.NewRecorder(),
+	New(nil, nil, nil).writeError(httptest.NewRecorder(),
 		httptest.NewRequest("GET", "/", nil), errors.New("boom"))
 }
 

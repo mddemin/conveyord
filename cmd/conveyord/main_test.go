@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mddemin/conveyor/internal/httpapi"
+	"github.com/mddemin/conveyor/internal/hub"
 	"github.com/mddemin/conveyor/internal/pgtest"
 	"github.com/mddemin/conveyor/internal/store"
 )
@@ -44,7 +45,7 @@ type jobResponse struct {
 
 func TestEnqueueAndReadBackOverHTTP(t *testing.T) {
 	s := freshDB(t) // the real *store.Store
-	api := httpapi.New(s, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	api := httpapi.New(s, hub.New(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	ts := httptest.NewServer(api)
 	t.Cleanup(ts.Close)
 

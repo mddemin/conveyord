@@ -54,13 +54,7 @@ func (rec *recorder) WriteHeader(code int) {
 	rec.ResponseWriter.WriteHeader(code)
 }
 
-// Flush forwards to the wrapped writer. Without this, embedding hides the
-// real writer's http.Flusher and SSE (phase 6) buffers forever.
-func (rec *recorder) Flush() {
-	if f, ok := rec.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
+func (rec *recorder) Unwrap() http.ResponseWriter { return rec.ResponseWriter }
 
 func (a *API) withRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
