@@ -66,9 +66,13 @@ type API struct {
 	heartbeat time.Duration
 }
 
-// New returns an API backed by store. A nil log defaults to slog.Default(),
-// so a wiring mistake degrades to the standard logger instead of panicking
-// on the first 500.
+// New returns an API backed by store, streaming the events published to
+// events. Both optional arguments degrade rather than fail: a nil log becomes
+// slog.Default() instead of panicking on the first 500, and a nil hub becomes
+// an empty one, so a caller that forgets to wire it gets streams that connect
+// and stay quiet instead of a nil dereference halfway through a response.
+// Neither is a supported way to call this — they are wiring mistakes that
+// should be visible in a log, not in a stack trace under load.
 func New(store Store, events *hub.Hub, log *slog.Logger) *API {
 	if log == nil {
 		log = slog.Default()

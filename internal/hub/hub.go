@@ -1,3 +1,29 @@
+// Package hub fans job events out to live subscribers.
+//
+// A [Hub] is a broadcaster and nothing more: publishers call [Hub.Publish] on
+// their own goroutine, subscribers read from the channel [Hub.Subscribe] hands
+// back on theirs, and the hub itself owns no goroutines and has no lifecycle.
+// There is nothing to start and nothing to shut down, which is one fewer thing
+// to leak. It holds no history — an event published before a subscription
+// exists is gone, and a subscriber that connects late sees only what happens
+// next.
+//
+// Publish never blocks. A subscriber whose buffer is full has its event
+// dropped and is marked lagged, rather than being waited for; one client on a
+// slow connection cannot stall a publisher or starve the other subscribers.
+// That is only acceptable because these events are not the record of what
+// happened — Postgres is. A dropped event costs a client one GET, which is
+// what [Subscription.Lagged] exists to tell it to do.
+//
+// The type system carries part of the safety argument. Subscribe hands back a
+// receive-only channel, so a subscriber cannot close or write to it, and the
+// only close is the one [Subscription.Close] performs under the write lock —
+// which is what makes a non-blocking send under the read lock safe.
+//
+// Everything here is safe for concurrent use. The hub is process-local: a
+// second conveyord has its own, and a client streaming from one will not see
+// events published to the other. That is fine while there is one process and
+// is the thing to fix first when there is not.
 package hub
 
 import (
