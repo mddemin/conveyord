@@ -81,17 +81,11 @@ func TestBackoffStaysWithinWindowWithRealRandomness(t *testing.T) {
 	}
 }
 
-type fixedClock struct{ t time.Time }
-
-func (c fixedClock) Now() time.Time { return c.t }
-
 func TestOnFailure(t *testing.T) {
-	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	p := Policy{
 		Base:        time.Second,
 		Max:         time.Minute,
 		MaxAttempts: 3,
-		Clock:       fixedClock{now},
 		Jitter:      noJitter,
 	}
 	boom := errors.New("boom")
@@ -106,13 +100,13 @@ func TestOnFailure(t *testing.T) {
 			name:    "first failure retries after Base",
 			attempt: 1,
 			cause:   boom,
-			want:    Decision{State: Pending, NextAttemptAt: now.Add(time.Second)},
+			want:    Decision{State: Pending, Backoff: time.Second},
 		},
 		{
 			name:    "second failure backs off further",
 			attempt: 2,
 			cause:   boom,
-			want:    Decision{State: Pending, NextAttemptAt: now.Add(2 * time.Second)},
+			want:    Decision{State: Pending, Backoff: 2 * time.Second},
 		},
 		{
 			name:    "final attempt is buried",
@@ -181,5 +175,56 @@ func TestOnFailureMaxAttemptsZero(t *testing.T) {
 	d := p.OnFailure(j, errors.New("boom"))
 	if d.State != Pending {
 		t.Fatalf("Job should be Pending: %v", d.State)
+	}
+}
+
+// Max is a cap on the window "however many attempts", including the first —
+// where the doubling loop that applies the cap never runs. A Base larger than
+// Max is a misconfiguration, and refusing to exceed the stated ceiling is the
+// one thing that must still hold under one.
+func TestBackoffNeverExceedsMax(t *testing.T) {
+	p := Policy{Base: 10 * time.Second, Max: time.Second, Jitter: noJitter}
+
+	for _, attempt := range []int{0, 1, 2, 3, 10} {
+		if got := p.Backoff(attempt); got > p.Max {
+			t.Errorf("Backoff(%d) = %v, want at most Max (%v)", attempt, got, p.Max)
+		}
+	}
+}
+
+// Max: 0 means "no cap", by the same reading as MaxAttempts: 0 meaning "no
+// limit" — not "no delay". A Policy that sets Base and MaxAttempts but no Max
+// must still back off; taking min(Base, 0) instead makes every retry immediate,
+// which is a hot loop between the dispatcher and Postgres that burns the whole
+// attempt budget as fast as the loop turns.
+func TestAnUnsetMaxIsNoCapNotNoDelay(t *testing.T) {
+	p := Policy{Base: time.Second, MaxAttempts: 3, Jitter: noJitter}
+
+	for _, attempt := range []int{1, 2, 3} {
+		if got := p.Backoff(attempt); got <= 0 {
+			t.Errorf("Backoff(%d) = %v with no Max set, want a real delay", attempt, got)
+		}
+	}
+}
+
+// "No cap" still has to mean a duration. Doubling an unbounded window walks off
+// the end of an int64 after about forty attempts, and time.Duration(float64)
+// wraps to the negative extreme rather than saturating — so next_attempt_at
+// becomes now() minus 292 years, the job is instantly leasable forever, and the
+// hot loop the test above describes arrives anyway, just later and disguised.
+// A job cannot reach attempt 40 today because MaxAttempts stops it, but nothing
+// in Backoff says so, and MaxAttempts: 0 also means no limit.
+//
+// The trap in fixing it: float64(math.MaxInt64) is 2^63, one *more* than
+// math.MaxInt64, because a float64 cannot represent 2^63-1. Clamping the float
+// to it therefore still overflows the conversion. It is a ceiling to stay
+// strictly under, not a value to clamp to.
+func TestAnUnsetMaxDoesNotOverflow(t *testing.T) {
+	p := Policy{Base: time.Second, Jitter: noJitter}
+
+	for _, attempt := range []int{40, 64, 100} {
+		if got := p.Backoff(attempt); got <= 0 {
+			t.Errorf("Backoff(%d) = %v, want a positive duration", attempt, got)
+		}
 	}
 }

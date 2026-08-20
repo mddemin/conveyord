@@ -15,7 +15,6 @@ import (
 
 	"github.com/mddemin/conveyor/internal/hub"
 	"github.com/mddemin/conveyor/internal/job"
-	"github.com/mddemin/conveyor/internal/store"
 )
 
 func newTestAPI(t *testing.T, store Store) *API {
@@ -59,7 +58,7 @@ func TestWriteErrorMapping(t *testing.T) {
 		want int
 	}{
 		{"not found", fmt.Errorf("job %s: %w", "j1", job.ErrNotFound), http.StatusNotFound},
-		{"duplicate", fmt.Errorf("job %s: %w", "j1", store.ErrDuplicate), http.StatusConflict},
+		{"duplicate", fmt.Errorf("job %s: %w", "j1", job.ErrDuplicate), http.StatusConflict},
 		{"bad transition", fmt.Errorf("x: %w", job.ErrInvalidTransition), http.StatusConflict},
 		{"invalid request", fmt.Errorf("type: %w", errInvalidRequest), http.StatusBadRequest},
 		{"unknown", errors.New("connection refused"), http.StatusInternalServerError},
@@ -104,7 +103,7 @@ func TestWriteErrorBodyIsAnObject(t *testing.T) {
 
 	for _, err := range []error{
 		fmt.Errorf("job j1: %w", job.ErrNotFound),
-		fmt.Errorf("job j1: %w", store.ErrDuplicate),
+		fmt.Errorf("job j1: %w", job.ErrDuplicate),
 		fmt.Errorf("type: %w", errInvalidRequest),
 		errors.New("connection refused"),
 	} {

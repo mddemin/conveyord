@@ -10,26 +10,25 @@ import (
 	"time"
 
 	"github.com/mddemin/conveyor/internal/job"
-	"github.com/mddemin/conveyor/internal/store"
 )
 
 // stubStore lets a test choose exactly what storage does, including fail.
 type stubStore struct {
 	enqueue func(ctx context.Context, j *job.Job) error
 	get     func(ctx context.Context, id string) (*job.Job, error)
-	list    func(ctx context.Context, f store.Filter) ([]job.Job, error)
+	list    func(ctx context.Context, f Filter) ([]job.Job, error)
 }
 
 func (s stubStore) Enqueue(ctx context.Context, j *job.Job) error        { return s.enqueue(ctx, j) }
 func (s stubStore) Get(ctx context.Context, id string) (*job.Job, error) { return s.get(ctx, id) }
-func (s stubStore) List(ctx context.Context, f store.Filter) ([]job.Job, error) {
+func (s stubStore) List(ctx context.Context, f Filter) ([]job.Job, error) {
 	return s.list(ctx, f)
 }
 
 // emptyList succeeds with no jobs. It is what the middleware tests want: a
 // route that reaches a handler and returns, where the handler itself is beside
 // the point.
-func emptyList(context.Context, store.Filter) ([]job.Job, error) { return nil, nil }
+func emptyList(context.Context, Filter) ([]job.Job, error) { return nil, nil }
 
 // do runs one request through the API's full routing and middleware and
 // returns what the client would have seen.
@@ -146,7 +145,7 @@ func TestEnqueueTrimsSurroundingSpace(t *testing.T) {
 
 func TestEnqueueRejectsADuplicate(t *testing.T) {
 	api := newTestAPI(t, stubStore{enqueue: func(context.Context, *job.Job) error {
-		return fmt.Errorf("job id x: %w", store.ErrDuplicate)
+		return fmt.Errorf("job id x: %w", job.ErrDuplicate)
 	}})
 
 	w := do(api, "POST", "/jobs", `{"id":"x","type":"resize"}`)
@@ -173,7 +172,7 @@ func TestListRejectsAnUnknownState(t *testing.T) {
 	// empty value is a broken client, not a wildcard.
 	for _, q := range []string{"?state=pnding", "?state=failed", "?state=PENDING", "?state="} {
 		t.Run(q, func(t *testing.T) {
-			api := newTestAPI(t, stubStore{list: func(context.Context, store.Filter) ([]job.Job, error) {
+			api := newTestAPI(t, stubStore{list: func(context.Context, Filter) ([]job.Job, error) {
 				t.Error("store was queried with an invalid state")
 				return nil, nil
 			}})
@@ -193,18 +192,18 @@ func TestListPassesTheQueryToTheStore(t *testing.T) {
 	tests := []struct {
 		name  string
 		query string
-		want  store.Filter
+		want  Filter
 	}{
-		{"nothing", "", store.Filter{}},
-		{"state only", "?state=leased", store.Filter{State: job.Leased}},
-		{"limit only", "?limit=5", store.Filter{Limit: 5}},
-		{"both", "?state=dead&limit=25", store.Filter{State: job.Dead, Limit: 25}},
+		{"nothing", "", Filter{}},
+		{"state only", "?state=leased", Filter{State: job.Leased}},
+		{"limit only", "?limit=5", Filter{Limit: 5}},
+		{"both", "?state=dead&limit=25", Filter{State: job.Dead, Limit: 25}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var got store.Filter
-			api := newTestAPI(t, stubStore{list: func(_ context.Context, f store.Filter) ([]job.Job, error) {
+			var got Filter
+			api := newTestAPI(t, stubStore{list: func(_ context.Context, f Filter) ([]job.Job, error) {
 				got = f
 				return nil, nil
 			}})
@@ -224,7 +223,7 @@ func TestListRejectsABadLimit(t *testing.T) {
 	// is undefined. Has() is what lets the handler tell it from absent.
 	for _, q := range []string{"?limit=abc", "?limit=-1", "?limit=0", "?limit=1.5", "?limit="} {
 		t.Run(q, func(t *testing.T) {
-			api := newTestAPI(t, stubStore{list: func(context.Context, store.Filter) ([]job.Job, error) {
+			api := newTestAPI(t, stubStore{list: func(context.Context, Filter) ([]job.Job, error) {
 				t.Error("store was queried with an invalid limit")
 				return nil, nil
 			}})
@@ -238,7 +237,7 @@ func TestListRejectsABadLimit(t *testing.T) {
 
 // A nil slice marshals to null. Every client then crashes on .length.
 func TestListReturnsAnEmptyArrayNotNull(t *testing.T) {
-	api := newTestAPI(t, stubStore{list: func(context.Context, store.Filter) ([]job.Job, error) {
+	api := newTestAPI(t, stubStore{list: func(context.Context, Filter) ([]job.Job, error) {
 		return nil, nil
 	}})
 
@@ -271,5 +270,43 @@ func TestWrongMethodIs405(t *testing.T) {
 	}
 	if allow := w.Header().Get("Allow"); !strings.Contains(allow, "POST") {
 		t.Errorf("Allow header is %q, want it to list POST", allow)
+	}
+}
+
+// ?limit is the one number a client makes arbitrarily large, and an unbounded
+// one is a query for every row in the table plus a response the server holds in
+// memory — from a single GET. The bound is enforced by rejecting, not clamping:
+// a client that asked for 10,000 rows and silently got 1,000 pages wrong.
+//
+// Both sides of the boundary, because a ceiling written as >= is a ceiling one
+// short of its documented value.
+func TestListBoundsTheLimit(t *testing.T) {
+	tests := []struct {
+		name      string
+		limit     int
+		wantCode  int
+		wantLimit int // what the store should have been asked for; 0 means never called
+	}{
+		{"at the ceiling", MaxLimit, http.StatusOK, MaxLimit},
+		{"one past it", MaxLimit + 1, http.StatusBadRequest, 0},
+		{"absurd", 100_000_000, http.StatusBadRequest, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got Filter
+			api := newTestAPI(t, stubStore{list: func(_ context.Context, f Filter) ([]job.Job, error) {
+				got = f
+				return nil, nil
+			}})
+
+			w := do(api, "GET", fmt.Sprintf("/jobs?limit=%d", tt.limit), "")
+			if w.Code != tt.wantCode {
+				t.Fatalf("?limit=%d returned %d, want %d: %s", tt.limit, w.Code, tt.wantCode, w.Body)
+			}
+			if got.Limit != tt.wantLimit {
+				t.Errorf("store received Limit=%d, want %d", got.Limit, tt.wantLimit)
+			}
+		})
 	}
 }

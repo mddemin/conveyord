@@ -43,15 +43,20 @@ import (
 
 	"github.com/mddemin/conveyor/internal/hub"
 	"github.com/mddemin/conveyor/internal/job"
-	"github.com/mddemin/conveyor/internal/store"
 )
+
+// Filter narrows a List query. The zero Filter matches every job.
+type Filter struct {
+	State job.State // empty matches any state
+	Limit int       // non-positive means DefaultLimit
+}
 
 // Store is the slice of storage this package needs. Declared here, not in
 // internal/store, so the API depends on a behaviour rather than on a struct.
 type Store interface {
 	Enqueue(ctx context.Context, j *job.Job) error
 	Get(ctx context.Context, id string) (*job.Job, error)
-	List(ctx context.Context, f store.Filter) ([]job.Job, error)
+	List(ctx context.Context, f Filter) ([]job.Job, error)
 }
 
 const requestTimeout = time.Minute
@@ -98,7 +103,7 @@ func (a *API) routes() http.Handler {
 
 	// Timeout is per-route, not global: http.TimeoutHandler buffers the whole
 	// response, and a buffered stream never streams.
-	timed := func(h http.HandlerFunc) http.Handler { return a.withTimeout(requestTimeout, h) }
+	timed := func(h http.HandlerFunc) http.Handler { return a.withTimeout(requestTimeout, a.withRecover(h)) }
 
 	mux.Handle("POST /jobs", timed(a.enqueue))
 	mux.Handle("GET /jobs/{id}", timed(a.get))

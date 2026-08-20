@@ -43,6 +43,11 @@ func TestFailFollowsTheStateMachine(t *testing.T) {
 	}
 }
 
+// The decision carries a duration, not an instant, so the schedule is written
+// as now() + interval by the database — and next_attempt_at must therefore be
+// measured against the database's clock, which is the same clock every Lease
+// compares it to. Asserting against time.Now() here would pass on one machine
+// and hide a skew that delays or skips every retry in production.
 func TestFailSchedulesARetry(t *testing.T) {
 	s := freshDB(t)
 	leaseN(t, s, 1, "agent-1")
@@ -55,8 +60,9 @@ func TestFailSchedulesARetry(t *testing.T) {
 	if d.State != job.Pending {
 		t.Errorf("decision state is %s, want %s", d.State, job.Pending)
 	}
-	if !d.NextAttemptAt.After(time.Now()) {
-		t.Errorf("decision schedules a retry at %v, want a time in the future", d.NextAttemptAt)
+	// retryPolicy pins jitter to the top of a one-hour window.
+	if d.Backoff != time.Hour {
+		t.Errorf("decision backs off by %v, want %v", d.Backoff, time.Hour)
 	}
 
 	got, err := s.Get(ctx, "j000")
@@ -70,14 +76,17 @@ func TestFailSchedulesARetry(t *testing.T) {
 		t.Errorf("attempt is %d after one failure, want 1", got.Attempt)
 	}
 
+	var dbNow time.Time
+	if err := s.pool.QueryRow(ctx, `SELECT now()`).Scan(&dbNow); err != nil {
+		t.Fatalf("reading the database clock: %v", err)
+	}
 	at := nextAttemptOf(t, s, "j000")
 	if at == nil {
 		t.Fatal("next_attempt_at is NULL on a job scheduled for retry")
 	}
-	// TIMESTAMPTZ keeps microseconds, time.Time keeps nanoseconds, so the
-	// round trip truncates. Compare at the precision the column actually has.
-	if !at.Equal(d.NextAttemptAt.Truncate(time.Microsecond)) {
-		t.Errorf("stored next_attempt_at is %v, want the returned %v", at, d.NextAttemptAt)
+	// A second of slack: the assertion is about the hour, not the milliseconds.
+	if delay := at.Sub(dbNow); delay < d.Backoff-time.Second || delay > d.Backoff+time.Second {
+		t.Errorf("next_attempt_at is %v after the database's now(), want the decided %v", delay, d.Backoff)
 	}
 }
 
@@ -171,7 +180,7 @@ func TestFailRejectsANilCause(t *testing.T) {
 	ctx := t.Context()
 
 	_, err := s.Fail(ctx, "j000", "agent-1", nil, retryPolicy(3))
-	if !errors.Is(err, ErrEmptyCause) {
+	if !errors.Is(err, job.ErrEmptyCause) {
 		t.Fatalf("Fail with a nil cause returned %v, want ErrEmptyCause", err)
 	}
 

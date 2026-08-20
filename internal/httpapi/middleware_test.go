@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/mddemin/conveyor/internal/job"
-	"github.com/mddemin/conveyor/internal/store"
 )
 
 func TestRequestIDIsGeneratedAndEchoed(t *testing.T) {
@@ -72,7 +71,7 @@ func TestRequestIDRejectsAHostileClientValue(t *testing.T) {
 
 func TestPanicBecomes500AndIsLogged(t *testing.T) {
 	api, logged := newTestAPIWithLogger(t, stubStore{
-		list: func(context.Context, store.Filter) ([]job.Job, error) { panic("boom") },
+		list: func(context.Context, Filter) ([]job.Job, error) { panic("boom") },
 	})
 
 	w := do(api, "GET", "/jobs", "")
@@ -204,7 +203,7 @@ func TestTimeoutIs503WithAJSONBody(t *testing.T) {
 // A panic must not take the process down with it.
 func TestServerSurvivesAPanic(t *testing.T) {
 	api := newTestAPI(t, stubStore{
-		list: func(context.Context, store.Filter) ([]job.Job, error) { panic("boom") },
+		list: func(context.Context, Filter) ([]job.Job, error) { panic("boom") },
 	})
 
 	do(api, "GET", "/jobs", "")
@@ -266,3 +265,28 @@ func TestFlusherSurvivesTheChainButNotATimeout(t *testing.T) {
 			"per-route timeouts were introduced on the premise that it cannot")
 	}
 }
+
+// Every JSON route is wrapped in http.TimeoutHandler, which runs the handler
+// on its own goroutine and re-panics the value on the serving one. By the time
+// withRecover's deferred recover runs, the goroutine that panicked is gone and
+// debug.Stack() describes the middleware chain instead: a 500 whose stack names
+// nothing but net/http, on every route a client can reach. Asserting that a
+// stack exists — as TestPanicBecomes500AndIsLogged does — passes either way;
+// the question is whether it points anywhere.
+func TestARecoveredPanicNamesTheCodeThatPanicked(t *testing.T) {
+	api, logged := newTestAPIWithLogger(t, stubStore{
+		list: func(context.Context, Filter) ([]job.Job, error) { return panicInAHandler() },
+	})
+
+	if w := do(api, "GET", "/jobs", ""); w.Code != http.StatusInternalServerError {
+		t.Fatalf("status after a panic is %d, want 500: %s", w.Code, w.Body)
+	}
+
+	if !strings.Contains(logged.String(), "panicInAHandler") {
+		t.Errorf("the recovered stack does not name the function that panicked: %s", logged)
+	}
+}
+
+// A named function so the assertion above has something to look for. Appearing
+// in a stack trace is its whole job.
+func panicInAHandler() ([]job.Job, error) { panic("boom") }

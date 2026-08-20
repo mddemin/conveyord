@@ -5,7 +5,6 @@ import (
 	"net/http"
 
 	"github.com/mddemin/conveyor/internal/job"
-	"github.com/mddemin/conveyor/internal/store"
 )
 
 // errInvalidRequest reports that a request is invalid
@@ -19,7 +18,7 @@ func (a *API) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, job.ErrNotFound):
 		status = http.StatusNotFound
-	case errors.Is(err, store.ErrDuplicate), errors.Is(err, job.ErrInvalidTransition):
+	case errors.Is(err, job.ErrDuplicate), errors.Is(err, job.ErrInvalidTransition):
 		status = http.StatusConflict
 	case errors.Is(err, errInvalidRequest):
 		status = http.StatusBadRequest

@@ -126,3 +126,25 @@ func TestCompleteOnAnUnleasedJob(t *testing.T) {
 		t.Fatalf("Complete on a pending job returned %v, want job.ErrNotFound", err)
 	}
 }
+
+// Complete reserves burial for Fail, so nothing reaches dead without the retry
+// policy having had a say and without a cause on the event. job.Dead is
+// terminal and reachable from leased, so neither the Transition check nor the
+// Terminal check stops it — only naming the one state Complete accepts does.
+func TestCompleteRefusesToBuryAJob(t *testing.T) {
+	s := freshDB(t)
+	leaseN(t, s, 1, "agent-1")
+	ctx := t.Context()
+
+	if err := s.Complete(ctx, "j000", "agent-1", job.Dead, "buried"); err == nil {
+		t.Error("Complete buried a job, bypassing the retry policy")
+	}
+
+	got, err := s.Get(ctx, "j000")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.State != job.Leased {
+		t.Errorf("state is %s after a rejected Complete, want %s", got.State, job.Leased)
+	}
+}

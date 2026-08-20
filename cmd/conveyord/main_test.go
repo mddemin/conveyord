@@ -48,7 +48,7 @@ type jobResponse struct {
 
 func TestEnqueueAndReadBackOverHTTP(t *testing.T) {
 	s := freshDB(t, hub.New()) // the real *store.Store
-	api := httpapi.New(s, hub.New(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	api := httpapi.New(jobStore{s}, hub.New(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	ts := httptest.NewServer(api)
 	t.Cleanup(ts.Close)
 

@@ -77,7 +77,7 @@ func (s *Store) Enqueue(ctx context.Context, j *job.Job) error {
 			var pgErr *pgconn.PgError
 			if errors.As(err, &pgErr) {
 				if pgErr.Code == uniqueViolation {
-					return fmt.Errorf("job id %s: %w", j.ID, ErrDuplicate)
+					return fmt.Errorf("job id %s: %w", j.ID, job.ErrDuplicate)
 				}
 			}
 			return fmt.Errorf("inserting job %s: %w", j.ID, err)
@@ -225,8 +225,8 @@ const leaseJobSQL = `
 // first would be a check on stale data, since any row can change between the
 // check and the UPDATE.
 func (s *Store) Lease(ctx context.Context, leasedBy string, n int, d time.Duration) ([]job.Job, error) {
-	if n <= 0 {
-		n = DefaultLimit
+	if n < 0 {
+		n = 0
 	}
 	rows, err := s.pool.Query(ctx, leaseJobSQL, n, leasedBy, d)
 	if err != nil {
@@ -302,6 +302,9 @@ func (s *Store) Complete(ctx context.Context, id, leasedBy string, state job.Sta
 	if !state.Terminal() {
 		return fmt.Errorf("completing job %s: %s is not terminal", id, state)
 	}
+	if state != job.Succeeded {
+		return fmt.Errorf("completing job %s: %s is not Succeeded", id, state)
+	}
 	ev := job.Event{Message: message}
 	err = s.pool.QueryRow(ctx, completeJobSQL, id, leasedBy, message, state).
 		Scan(&ev.JobID, &ev.State, &ev.CreatedAt)
@@ -374,7 +377,7 @@ const updateFailedJobSQL = `
       UPDATE jobs
       SET state            = $1,
           attempt          = $2,
-          next_attempt_at  = $3,
+          next_attempt_at  = now() + $3,
           leased_by        = NULL,
           lease_expires_at = NULL,
           updated_at       = now()
@@ -387,7 +390,7 @@ const updateFailedJobSQL = `
 func (s *Store) Fail(ctx context.Context, id, leasedBy string, cause error, p job.Policy) (job.Decision, error) {
 	var d job.Decision
 	if cause == nil {
-		return d, fmt.Errorf("job %s: %w", id, ErrEmptyCause)
+		return d, fmt.Errorf("job %s: %w", id, job.ErrEmptyCause)
 	}
 	var ev job.Event
 
@@ -404,12 +407,12 @@ func (s *Store) Fail(ctx context.Context, id, leasedBy string, cause error, p jo
 		j.Attempt++
 		d = p.OnFailure(&j, cause)
 
-		nextAttempt := &d.NextAttemptAt
-		if d.NextAttemptAt.IsZero() {
-			nextAttempt = nil
+		backoff := &d.Backoff
+		if *backoff == 0 {
+			backoff = nil
 		}
 
-		_, err = tx.Exec(ctx, updateFailedJobSQL, d.State, j.Attempt, nextAttempt, id)
+		_, err = tx.Exec(ctx, updateFailedJobSQL, d.State, j.Attempt, backoff, id)
 		if err != nil {
 			return fmt.Errorf("updating failed job %s leased by %s: %w", id, leasedBy, err)
 		}

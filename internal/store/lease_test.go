@@ -253,3 +253,33 @@ func TestLeaseRecordsAnEvent(t *testing.T) {
 		t.Errorf("unleased job has %d events, want 1", len(untouched))
 	}
 }
+
+// Lease(n) where n came from arithmetic must mean "this many and no more".
+// Phase 7's dispatcher passes its free capacity: if a zero there becomes
+// DefaultLimit, a dispatcher with no free slots leases a hundred jobs that
+// nothing will run and holds them until every one of those leases expires.
+func TestLeaseWithNoCapacityTakesNothing(t *testing.T) {
+	for _, n := range []int{0, -1} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			s := freshDB(t)
+			enqueueN(t, s, 3)
+			ctx := t.Context()
+
+			got, err := s.Lease(ctx, "agent-1", n, time.Minute)
+			if err != nil {
+				t.Fatalf("Lease: %v", err)
+			}
+			if len(got) != 0 {
+				t.Errorf("Lease(n=%d) handed out %v, want nothing", n, ids(got))
+			}
+
+			j, err := s.Get(ctx, "j000")
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if j.State != job.Pending {
+				t.Errorf("job is %s after a zero-capacity Lease, want %s", j.State, job.Pending)
+			}
+		})
+	}
+}

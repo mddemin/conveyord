@@ -14,8 +14,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mddemin/conveyor/internal/httpapi"
 	"github.com/mddemin/conveyor/internal/hub"
+	"github.com/mddemin/conveyor/internal/job"
 	"github.com/mddemin/conveyor/internal/store"
 )
+
+// jobStore adapts *store.Store to httpapi.Store: the API declares the filter
+// it needs, storage declares its own, and main is where the two meet.
+type jobStore struct{ *store.Store }
+
+func (s jobStore) List(ctx context.Context, f httpapi.Filter) ([]job.Job, error) {
+	return s.Store.List(ctx, store.Filter{State: f.State, Limit: f.Limit})
+}
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -58,7 +67,7 @@ func run(log *slog.Logger) error {
 
 	hub := hub.New()
 
-	api := httpapi.New(store.New(pool, hub), hub, log)
+	api := httpapi.New(jobStore{store.New(pool, hub)}, hub, log)
 
 	srv := &http.Server{
 		Addr:              *addr,

@@ -25,7 +25,7 @@ func liveServer(t *testing.T) (*store.Store, *httptest.Server) {
 	t.Helper()
 	h := hub.New()
 	s := freshDB(t, h)
-	ts := httptest.NewServer(httpapi.New(s, h, slog.New(slog.NewJSONHandler(io.Discard, nil))))
+	ts := httptest.NewServer(httpapi.New(jobStore{s}, h, slog.New(slog.NewJSONHandler(io.Discard, nil))))
 	t.Cleanup(ts.Close)
 	return s, ts
 }
@@ -175,25 +175,74 @@ func TestJobLifecycleReachesItsOwnStream(t *testing.T) {
 
 // A per-job stream must not carry another job's events, over the wire and not
 // merely inside the hub.
+//
+// The other job changes state first, so a leaked event necessarily arrives
+// before the watched one — waiting for the watched event is then enough to have
+// observed the leak, with no sleeping and no proving a negative. Asserting on
+// the matched frame alone would be vacuous: awaitData selected that frame
+// because it names the watched job, so a leak can only ever be in the frames
+// before it.
 func TestAJobStreamIgnoresOtherJobs(t *testing.T) {
 	s, ts := liveServer(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
 
-	watched := postJob(t, ctx, ts, `{"type":"resize","payload":{"w":1}}`)
+	// Enqueued first, and Lease takes the oldest first, so this is the job that
+	// changes state first.
 	other := postJob(t, ctx, ts, `{"type":"resize","payload":{"w":2}}`)
+	watched := postJob(t, ctx, ts, `{"type":"resize","payload":{"w":1}}`)
 
 	lines := openStream(t, ctx, ts.URL+"/jobs/"+watched.ID+"/events")
 
-	// Both jobs change state; only one of them is being watched. Waiting for
-	// the watched job's event is what makes this deterministic — by the time
-	// it arrives the other job's event has already been through the hub.
-	if _, err := s.Lease(ctx, "agent-1", 2, time.Minute); err != nil {
-		t.Fatalf("Lease: %v", err)
+	first, err := s.Lease(ctx, "agent-1", 1, time.Minute)
+	if err != nil {
+		t.Fatalf("leasing the unwatched job: %v", err)
 	}
-	data := awaitData(t, ctx, lines, watched.ID)
+	// The ordering this test rests on, asserted rather than assumed.
+	if len(first) != 1 || first[0].ID != other.ID {
+		t.Fatalf("first lease took %v, want the older unwatched job %s", ids(first), other.ID)
+	}
+	if _, err := s.Lease(ctx, "agent-1", 1, time.Minute); err != nil {
+		t.Fatalf("leasing the watched job: %v", err)
+	}
 
-	if strings.Contains(data, other.ID) {
-		t.Errorf("another job's event reached this stream: %s", data)
+	for _, data := range collectDataUntil(t, ctx, lines, watched.ID) {
+		if strings.Contains(data, other.ID) {
+			t.Errorf("another job's event reached this stream: %s", data)
+		}
 	}
+}
+
+// collectDataUntil returns every data: payload the stream delivered up to and
+// including the first one containing want. The frames before the match are the
+// interesting ones: they are the frames that should never have been sent.
+func collectDataUntil(t *testing.T, ctx context.Context, lines <-chan string, want string) []string {
+	t.Helper()
+	var seen []string
+	for {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				t.Fatalf("the stream closed before %q arrived; saw %v", want, seen)
+			}
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			seen = append(seen, strings.TrimPrefix(line, "data: "))
+			if strings.Contains(seen[len(seen)-1], want) {
+				return seen
+			}
+		case <-ctx.Done():
+			t.Fatalf("no event containing %q reached the client: %v (saw %v)", want, ctx.Err(), seen)
+		}
+	}
+}
+
+// ids names the jobs in a lease, for failure messages.
+func ids(jobs []job.Job) []string {
+	out := make([]string, 0, len(jobs))
+	for _, j := range jobs {
+		out = append(out, j.ID)
+	}
+	return out
 }

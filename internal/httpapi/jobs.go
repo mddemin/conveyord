@@ -7,8 +7,9 @@ import (
 	"strconv"
 
 	"github.com/mddemin/conveyor/internal/job"
-	"github.com/mddemin/conveyor/internal/store"
 )
+
+const MaxLimit = 1000
 
 func (a *API) enqueue(w http.ResponseWriter, r *http.Request) {
 	req, err := decodeJSON[enqueueRequest](w, r)
@@ -55,7 +56,7 @@ func (a *API) get(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) list(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	f := store.Filter{}
+	f := Filter{}
 
 	if q.Has("state") {
 		s := q.Get("state")
@@ -68,7 +69,7 @@ func (a *API) list(w http.ResponseWriter, r *http.Request) {
 
 	if q.Has("limit") {
 		limit, err := strconv.Atoi(q.Get("limit"))
-		if err != nil || limit <= 0 {
+		if err != nil || limit <= 0 || limit > MaxLimit {
 			a.writeError(w, r, fmt.Errorf("%w: limit %q is not valid", errInvalidRequest, q.Get("limit")))
 			return
 		}

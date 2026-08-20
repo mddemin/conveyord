@@ -54,7 +54,7 @@ func TestEnqueueRejectsDuplicateID(t *testing.T) {
 	}
 
 	err := s.Enqueue(ctx, &job.Job{ID: "j1", Type: "other"})
-	if !errors.Is(err, ErrDuplicate) {
+	if !errors.Is(err, job.ErrDuplicate) {
 		t.Fatalf("second Enqueue with the same ID returned %v, want ErrDuplicate", err)
 	}
 }
@@ -170,7 +170,7 @@ func TestFailedEnqueueWritesNothing(t *testing.T) {
 	if err := s.Enqueue(ctx, &job.Job{ID: "j1", Type: "resize"}); err != nil {
 		t.Fatalf("first Enqueue: %v", err)
 	}
-	if err := s.Enqueue(ctx, &job.Job{ID: "j1", Type: "other"}); !errors.Is(err, ErrDuplicate) {
+	if err := s.Enqueue(ctx, &job.Job{ID: "j1", Type: "other"}); !errors.Is(err, job.ErrDuplicate) {
 		t.Fatalf("second Enqueue returned %v, want ErrDuplicate", err)
 	}
 
