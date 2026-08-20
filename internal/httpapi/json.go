@@ -26,12 +26,10 @@ func decodeJSON[T any](w http.ResponseWriter, r *http.Request) (T, error) {
 
 	var v T
 	if err := dec.Decode(&v); err != nil {
-		var synErr *json.SyntaxError
-		if errors.As(err, &synErr) {
+		if synErr, ok := errors.AsType[*json.SyntaxError](err); ok {
 			return v, fmt.Errorf("%w: malformed JSON, offset: %v", errInvalidRequest, synErr.Offset)
 		}
-		var unmErr *json.UnmarshalTypeError
-		if errors.As(err, &unmErr) {
+		if unmErr, ok := errors.AsType[*json.UnmarshalTypeError](err); ok {
 			if unmErr.Field == "" {
 				return v, fmt.Errorf("%w: body must be a JSON object, got %s", errInvalidRequest, unmErr.Value)
 			}
@@ -43,8 +41,7 @@ func decodeJSON[T any](w http.ResponseWriter, r *http.Request) (T, error) {
 		if errors.Is(err, io.ErrUnexpectedEOF) {
 			return v, fmt.Errorf("%w: body contains malformed JSON", errInvalidRequest)
 		}
-		var maxBErr *http.MaxBytesError
-		if errors.As(err, &maxBErr) {
+		if maxBErr, ok := errors.AsType[*http.MaxBytesError](err); ok {
 			return v, fmt.Errorf("%w: body must not exceed %v bytes", errInvalidRequest, maxBErr.Limit)
 		}
 		if strings.HasPrefix(err.Error(), "json: unknown field ") {
@@ -71,7 +68,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) error {
 	if err != nil {
 
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(`{"error":"internal error"}`))
+		_, _ = w.Write([]byte(`{"error":"internal error"}`))
 		return fmt.Errorf("marshaling %T: %w", v, err)
 	}
 

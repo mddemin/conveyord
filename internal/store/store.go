@@ -74,8 +74,7 @@ func (s *Store) Enqueue(ctx context.Context, j *job.Job) error {
 			insertJobSQL,
 			j.ID, j.Type, payload, job.Pending).Scan(&j.CreatedAt, &j.UpdatedAt)
 		if err != nil {
-			var pgErr *pgconn.PgError
-			if errors.As(err, &pgErr) {
+			if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
 				if pgErr.Code == uniqueViolation {
 					return fmt.Errorf("job id %s: %w", j.ID, job.ErrDuplicate)
 				}
