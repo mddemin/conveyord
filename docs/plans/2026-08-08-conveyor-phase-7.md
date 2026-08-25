@@ -319,6 +319,7 @@ type Config struct {
 	Interval    time.Duration // how often to poll when there is no work
 	Lease       time.Duration // how long a lease is held
 	MaxInFlight int           // jobs running at once
+	ReapInterval time.Duration // how often the reaper sweeps for expired leases
 	Policy      job.Policy
 }
 
@@ -374,7 +375,17 @@ type fakeStore struct {
 	failed   []string
 }
 
-func (f *fakeStore) Lease(_ context.Context, _ string, n int, _ time.Duration) ([]job.Job, error) {
+// Every method starts by refusing a cancelled context. pgx does this — a query on a
+// cancelled context fails before touching the database — and the fake must too, or
+// Task 2's shutdown tests cannot tell a recorded result from a discarded one.
+func refused(ctx context.Context) error {
+	return ctx.Err()
+}
+
+func (f *fakeStore) Lease(ctx context.Context, _ string, n int, _ time.Duration) ([]job.Job, error) {
+	if err := refused(ctx); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.leases++
@@ -384,21 +395,30 @@ func (f *fakeStore) Lease(_ context.Context, _ string, n int, _ time.Duration) (
 	return f.lease(n)
 }
 
-func (f *fakeStore) Renew(_ context.Context, id, _ string, _ time.Duration) error {
+func (f *fakeStore) Renew(ctx context.Context, id, _ string, _ time.Duration) error {
+	if err := refused(ctx); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.renewed = append(f.renewed, id)
 	return nil
 }
 
-func (f *fakeStore) Complete(_ context.Context, id, _ string, _ job.State, _ string) error {
+func (f *fakeStore) Complete(ctx context.Context, id, _ string, _ job.State, _ string) error {
+	if err := refused(ctx); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.complete = append(f.complete, id)
 	return nil
 }
 
-func (f *fakeStore) Fail(_ context.Context, id, _ string, _ error, _ job.Policy) (job.Decision, error) {
+func (f *fakeStore) Fail(ctx context.Context, id, _ string, _ error, _ job.Policy) (job.Decision, error) {
+	if err := refused(ctx); err != nil {
+		return job.Decision{}, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failed = append(f.failed, id)
@@ -505,11 +525,16 @@ func TestNothingLeasedWaitsForTheTicker(t *testing.T) {
 	stop := run(t, d)
 	defer stop()
 
-	// One immediate pass, then nothing for a while: proving a negative, so the
-	// wait is the assertion.
+	// The immediate pass has landed. Waiting for it first keeps a slow CI
+	// machine from reaching the assertion below before the pass ran at all.
+	waitFor(t, func() bool { return s.leaseCount() >= 1 })
+	first := s.leaseCount()
+
+	// Proving a negative (constraint 2's one exception): nothing further
+	// until the tick.
 	time.Sleep(200 * time.Millisecond)
-	if n := s.leaseCount(); n != 1 {
-		t.Errorf("made %d lease attempts in 200ms with a 500ms interval, want 1", n)
+	if got := s.leaseCount(); got != first {
+		t.Errorf("%d lease attempts total, want still %d (no tick-driven pass within 200ms)", got, first)
 	}
 }
 ```
@@ -561,8 +586,15 @@ blocking there means the loop is not watching `ctx.Done()`:
 
 ```go
 free := d.cfg.MaxInFlight - int(d.inFlight.Load())
-if free <= 0 {
-	// wait for a slot or for shutdown, whichever comes first
+for free <= 0 {
+	// No slot is free. Wait for one to open or for shutdown, whichever
+	// comes first. slotFreed is runOne's completion signal (below).
+	select {
+	case <-d.slotFreed:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	free = d.cfg.MaxInFlight - int(d.inFlight.Load())
 }
 leased, err := d.store.Lease(ctx, d.cfg.Name, free, d.cfg.Lease)
 ```
@@ -570,6 +602,20 @@ leased, err := d.store.Lease(ctx, d.cfg.Name, free, d.cfg.Lease)
 The alternative — lease a fixed batch and let `g.Go` block — leaves jobs leased but not
 started, holding a lease they are not using, which the reaper will eventually take back
 while they sit in a queue. Worse than it sounds.
+
+`slotFreed` is the whole signalling mechanism — created in `New` as
+`make(chan struct{}, 1)`, signalled from `runOne`'s defer:
+
+```go
+select {
+case d.slotFreed <- struct{}{}:
+default: // a token is already pending; the loop recomputes free on wake anyway
+}
+```
+
+A lost or duplicate token costs nothing: the loop recomputes `free` after every wake, so
+tokens decide when to look, never what is safe to lease. No mutex, no condition variable,
+no second ticker.
 
 ### Recording the outcome
 
@@ -605,6 +651,10 @@ defer cancel()
 
 `context.WithoutCancel` keeps values (request IDs, traces) and drops cancellation. This is
 the single most valuable line in the phase and it is invisible until you test shutdown.
+
+This is only observable because the fake store refuses cancelled contexts (`refused` in
+Task 1's `fakeStore`). A fake that ignored its context would record the result either way,
+and the test would assert nothing.
 
 **A `Fail` or `Complete` error is logged, not returned.** There is nobody to return it to.
 The job keeps its lease, the lease expires, the reaper returns it to `pending`, and it runs
@@ -736,8 +786,10 @@ func TestAJobFinishingDuringShutdownIsStillRecorded(t *testing.T) {
 `oneJob(id)` and `manyJobs(n)` are two-line helpers returning a `lease` function; write them
 next to `fakeStore`.
 
-The last test is the one that fails without `context.WithoutCancel`, and it is worth running
-it against a deliberately broken version once so you see the failure before you fix it.
+The last test is the one that fails without `context.WithoutCancel` — and it can only fail
+because `fakeStore` refuses cancelled contexts (`refused` in Task 1); a context-blind fake
+would record the result either way. It is worth running it against a deliberately broken
+version of `runOne` once so you see the failure before you fix it.
 
 ---
 
@@ -775,7 +827,10 @@ go func() {
 		select {
 		case <-tk.C:
 			if err := d.store.Renew(renewCtx, j.ID, d.cfg.Name, d.cfg.Lease); err != nil {
-				cancelJob(err) // we no longer hold this job
+				if renewCtx.Err() != nil {
+					return // job finished or dispatcher shutting down; not a lease event
+				}
+				cancelJob(fmt.Errorf("%w: %v", ErrLeaseLost, err)) // someone else owns j.ID now
 				return
 			}
 		case <-renewCtx.Done():
@@ -791,8 +846,16 @@ leaves no margin; a third is the usual choice and is worth a comment saying why.
 
 **Failing to renew must cancel the job.** This is the important half. `Renew` returns
 `job.ErrNotFound` when the row is no longer leased by you, which means someone else owns it
-now. Continuing to run is doing work whose result you are not allowed to record — and if you
-record it anyway you overwrite the new owner's outcome. Stop immediately.
+now. Recording a result anyway is impossible — `Complete` and `Fail` both guard on
+`leased_by` and `state='leased'`, so the late write lands as zero rows and `ErrNotFound` —
+but continuing to run still burns work the queue will never accept and leaves the executor's
+side effects diverging from what the queue believes. Stop immediately: cancel the job,
+abandon the result.
+
+The `renewCtx.Err()` check in the sketch is load-bearing, not decoration. When a job
+finishes, `runOne` cancels `renewCtx`, and any renewal already in flight fails with
+`context.Canceled`. That is the system working, not a lease loss; treating it as one would
+cancel an already-finished job and log a spurious error on nearly every completion.
 
 That gives the per-job context two cancellation sources, which is exactly what
 `context.WithCancel` composes:
@@ -986,6 +1049,9 @@ func main() {
 `run` takes `args` rather than reading `os.Args`, and takes `stop` so it can disarm the
 signal handler the moment the first signal lands (0.3). Passing the logger keeps `run`
 testable without touching the default.
+It also takes `onListen func(net.Addr)` — decided, not optional: main passes a callback
+that logs the bound address, tests pass one that captures it into a channel so `-addr :0`
+works. No variadic options, no second return value.
 
 Inside, in order:
 
@@ -998,8 +1064,14 @@ defer pool.Close()
 events := hub.New()
 st := store.New(pool, events)
 
-// 3. base context for HTTP, so streaming handlers can be told to stop
-baseCtx, cancelBase := context.WithCancel(context.Background())
+// 3. the group first: baseCtx hangs off gctx, so a component failing early
+// tears HTTP down through the same path a signal takes.
+g, gctx := errgroup.WithContext(ctx)
+
+// 4. base context for HTTP, child of gctx. Cancelling it ends every streaming
+// handler; it inherits component-failure cancellation for free, and constraint 4
+// keeps its exactly-one-context.Background() promise.
+baseCtx, cancelBase := context.WithCancel(gctx)
 defer cancelBase()
 
 srv := &http.Server{
@@ -1010,14 +1082,14 @@ srv := &http.Server{
 
 d := dispatch.New(st, runner, log, cfg)
 
-g, gctx := errgroup.WithContext(ctx)
 g.Go(func() error { return serve(srv, ln) })   // returns nil on ErrServerClosed
 g.Go(func() error { return d.Run(gctx) })
 g.Go(func() error { return d.Reap(gctx) })
-g.Go(func() error {                            // the shutdown sequencer
+g.Go(func() error {                        // the shutdown sequencer
 	<-gctx.Done()
-	stop()                                     // a second signal now kills us
-	cancelBase()                               // SSE handlers return
+	stop()                             // a second signal now kills us
+	// baseCtx is a child of gctx and is already cancelled here, so every
+	// streaming handler's r.Context() is done before Shutdown drains.
 	shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), drainTimeout)
 	defer cancel()
 	return srv.Shutdown(shutCtx)
@@ -1042,9 +1114,15 @@ as an error means every normal exit reports failure.
 `g.Wait()` on its own group, so `errgroup.Wait` at the root returns only once jobs are done
 or their contexts have been cancelled and they have returned.
 
+That wait is unbounded on purpose, and the escape hatch is deliberate: a runner that honours
+its context returns promptly; one that ignores it is killed the hard way, because `stop()`
+disarmed the signal handler on the first signal and the second Ctrl-C terminates the process
+outright (0.3). Name this in the shutdown log line instead of leaving it to be discovered
+during an incident.
+
 ### Requirements
 
-- Flags: keep `-addr` and `-dsn`, add `-max-in-flight`, `-poll`, `-lease`, `-drain`. Defaults must make `go run ./cmd/conveyord` work against a local Postgres with no flags.
+- Flags: keep `-addr` and `-dsn`, add `-max-in-flight`, `-poll`, `-lease`, `-drain`. Defaults must make `go run ./cmd/conveyord` work against a local Postgres with no flags — suggested: `-max-in-flight 10`, `-poll 500ms`, `-lease 30s`, `-drain 15s`.
 - `Name` defaults to `hostname-pid`.
 - Log one line at startup with the effective configuration. The first question in any incident is "what was it actually running with".
 - Log one line when shutdown begins, and one when it completes, with the elapsed time.
@@ -1061,11 +1139,14 @@ func TestSIGTERMDrainsAnInFlightJob(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	errc := make(chan error, 1)
+	addrc := make(chan net.Addr, 1)
 	// Exits when ctx is cancelled below, which is what a signal does to the
 	// context main builds.
 	go func() {
-		errc <- run(ctx, []string{"-addr", "127.0.0.1:0", "-dsn", dsn}, testLogger(t), func() {})
+		errc <- run(ctx, []string{"-addr", "127.0.0.1:0", "-dsn", dsn}, testLogger(t), func() {},
+			func(a net.Addr) { addrc <- a })
 	}()
+	addr := <-addrc
 
 	// ...enqueue a job over HTTP, wait for it to reach leased on the event
 	// stream, then cancel and assert: run returns within the drain window,
@@ -1075,9 +1156,9 @@ func TestSIGTERMDrainsAnInFlightJob(t *testing.T) {
 
 Two things this needs and one caveat:
 
-`run` must report the address it bound to, since `-addr :0` is the only way to test without
-picking a port. Add an optional `func(net.Addr)` callback parameter, or have `run` write the
-address to a channel — the callback is less machinery.
+`run` reports the address it bound to through the `onListen func(net.Addr)` parameter:
+main passes a logging callback, the test captures into a channel. `-addr :0` is the only
+way to test without picking a port, and the callback is the least machinery that delivers it.
 
 `pgtest` needs to expose the DSN, not just a pool, because `run` takes a DSN string. Three
 lines next to `Pool`.

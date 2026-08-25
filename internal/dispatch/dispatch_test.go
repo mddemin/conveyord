@@ -1,0 +1,398 @@
+package dispatch
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"runtime"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/mddemin/conveyor/internal/job"
+)
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition never became true")
+		}
+		runtime.Gosched()
+	}
+}
+
+// fakeStore is a Store that records calls and hands out scripted jobs. Locked
+// because the dispatcher calls it from several goroutines — and the test
+// goroutine reads through the accessors, so every reader takes the lock too.
+type fakeStore struct {
+	mu sync.Mutex
+
+	lease     func(n int) ([]job.Job, error) // nil means "no work"
+	leases    int
+	renewed   []string
+	complete  []string
+	failed    []string
+	lastCause error // cause passed to the most recent Fail call
+}
+
+// Every method starts by refusing a cancelled context. pgx does this — a query on a
+// cancelled context fails before touching the database — and the fake must too, or
+// Task 2's shutdown tests cannot tell a recorded result from a discarded one.
+func refused(ctx context.Context) error {
+	return ctx.Err()
+}
+
+func (f *fakeStore) Lease(ctx context.Context, _ string, n int, _ time.Duration) ([]job.Job, error) {
+	if err := refused(ctx); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.leases++
+	if f.lease == nil {
+		return nil, nil
+	}
+	return f.lease(n)
+}
+
+func (f *fakeStore) Renew(ctx context.Context, id, _ string, _ time.Duration) error {
+	if err := refused(ctx); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.renewed = append(f.renewed, id)
+	return nil
+}
+
+func (f *fakeStore) Complete(ctx context.Context, id, _ string, _ job.State, _ string) error {
+	if err := refused(ctx); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.complete = append(f.complete, id)
+	return nil
+}
+
+func (f *fakeStore) Fail(ctx context.Context, id, _ string, cause error, _ job.Policy) (job.Decision, error) {
+	if err := refused(ctx); err != nil {
+		return job.Decision{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failed = append(f.failed, id)
+	f.lastCause = cause
+	return job.Decision{State: job.Pending}, nil
+}
+
+// Accessors. Every one locks: a getter racing a mutator is the data race
+// that brought this suite down once already.
+func (f *fakeStore) leaseCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.leases
+}
+
+func (f *fakeStore) completedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.complete)
+}
+
+func (f *fakeStore) completedIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.complete)
+}
+
+func (f *fakeStore) failedIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.failed)
+}
+
+func (f *fakeStore) renewedIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.renewed)
+}
+
+// failCause reports the cause the dispatcher handed to the most recent Fail.
+// The assertion downstream is errors.Is, so wrapping in the dispatcher is fine;
+// replacing the error is not — the cause drives retry-versus-dead-letter.
+func (f *fakeStore) failCause() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastCause
+}
+
+// runnerFunc adapts a function to Runner.
+type runnerFunc func(context.Context, job.Job) error
+
+func (f runnerFunc) Run(ctx context.Context, j job.Job) error { return f(ctx, j) }
+
+// Scripted lease hooks. Each hands out jobs until its budget runs out, then
+// reports an empty queue.
+func oneJob(id string) func(int) ([]job.Job, error) {
+	return func(n int) ([]job.Job, error) {
+		if n <= 0 {
+			return nil, nil
+		}
+		return []job.Job{{ID: id, State: job.Leased}}, nil
+	}
+}
+
+func manyJobs(total int64) func(int) ([]job.Job, error) {
+	var handed atomic.Int64
+	return func(n int) ([]job.Job, error) {
+		if handed.Load() >= total {
+			return nil, nil
+		}
+		out := make([]job.Job, n)
+		for i := range out {
+			out[i] = job.Job{ID: fmt.Sprintf("j%d", handed.Add(1)), State: job.Leased}
+		}
+		return out, nil
+	}
+}
+
+func newTestDispatcher(t *testing.T, s Store, r Runner) *Dispatcher {
+	t.Helper()
+	return New(s, r, slog.New(slog.NewTextHandler(io.Discard, nil)), Config{
+		Name:        "test",
+		Interval:    time.Millisecond,
+		Lease:       time.Minute,
+		MaxInFlight: 4,
+		Policy:      job.Policy{Base: time.Millisecond, Max: time.Second, MaxAttempts: 3},
+	})
+}
+
+// run starts the dispatcher and returns a stop function that cancels it and
+// waits for Run to return. Every test needs this shape.
+func run(t *testing.T, d *Dispatcher) func() {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	// Exits when ctx is cancelled, which the returned stop function does and
+	// then waits for.
+	go func() { errc <- d.Run(ctx) }()
+	return func() {
+		cancel()
+		select {
+		case err := <-errc:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("Run returned %v, want nil or context.Canceled", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Run did not return within 5s of cancellation")
+		}
+	}
+}
+
+// --- Task 1: the loop -------------------------------------------------------
+
+// A fresh process must not wait a full interval before looking for work.
+func TestFirstPassHappensBeforeTheFirstTick(t *testing.T) {
+	s := &fakeStore{}
+	d := newTestDispatcher(t, s, runnerFunc(func(context.Context, job.Job) error { return nil }))
+	d.cfg.Interval = time.Hour // no tick will arrive during this test
+
+	stop := run(t, d)
+	defer stop()
+
+	waitFor(t, func() bool { return s.leaseCount() > 0 })
+}
+
+func TestCancellationReturnsPromptly(t *testing.T) {
+	s := &fakeStore{}
+	d := newTestDispatcher(t, s, runnerFunc(func(context.Context, job.Job) error { return nil }))
+
+	stop := run(t, d) // stop asserts Run returns within 5s
+	stop()
+}
+
+// The database going away must not take the daemon with it.
+func TestALeaseErrorDoesNotStopTheLoop(t *testing.T) {
+	s := &fakeStore{lease: func(int) ([]job.Job, error) { return nil, errors.New("connection refused") }}
+	d := newTestDispatcher(t, s, runnerFunc(func(context.Context, job.Job) error { return nil }))
+
+	stop := run(t, d)
+	defer stop()
+
+	waitFor(t, func() bool { return s.leaseCount() >= 3 })
+}
+
+// A backlog should drain at the speed of the work, not at the speed of the
+// ticker. A full batch means there is probably more.
+func TestAFullBatchIsFollowedImmediately(t *testing.T) {
+	s := &fakeStore{lease: manyJobs(8)}
+	d := newTestDispatcher(t, s, runnerFunc(func(context.Context, job.Job) error { return nil }))
+	d.cfg.Interval = time.Hour // only the drain path can produce further passes
+
+	stop := run(t, d)
+	defer stop()
+
+	waitFor(t, func() bool { return s.completedCount() >= 8 })
+}
+
+func TestNothingLeasedWaitsForTheTicker(t *testing.T) {
+	s := &fakeStore{}
+	d := newTestDispatcher(t, s, runnerFunc(func(context.Context, job.Job) error { return nil }))
+	d.cfg.Interval = 500 * time.Millisecond
+
+	stop := run(t, d)
+	defer stop()
+
+	// The immediate pass has landed. Waiting for it first keeps a slow CI
+	// machine from reaching the assertion below before the pass ran at all.
+	waitFor(t, func() bool { return s.leaseCount() >= 1 })
+	first := s.leaseCount()
+
+	// Proving a negative (constraint 2's one exception): nothing further
+	// until the tick.
+	time.Sleep(200 * time.Millisecond)
+	if got := s.leaseCount(); got != first {
+		t.Errorf("%d lease attempts total, want still %d (no tick-driven pass within 200ms)", got, first)
+	}
+}
+
+// --- Task 2: running jobs, bounded ------------------------------------------
+
+func TestASuccessfulJobIsCompleted(t *testing.T) {
+	s := &fakeStore{lease: oneJob("j1")}
+	d := newTestDispatcher(t, s, runnerFunc(func(context.Context, job.Job) error { return nil }))
+
+	stop := run(t, d)
+	defer stop()
+
+	waitFor(t, func() bool { return len(s.completedIDs()) > 0 })
+	if got := s.completedIDs()[0]; got != "j1" {
+		t.Errorf("completed %q, want j1", got)
+	}
+	if ids := s.failedIDs(); len(ids) != 0 {
+		t.Errorf("a successful job was also failed: %v", ids)
+	}
+}
+
+// The cause is not decoration: store.Fail feeds it to the retry policy, and
+// IsPermanent on the wrapped chain decides retry versus dead-letter. A
+// dispatcher that swapped the error for a generic one would make every
+// permanent failure look retryable.
+func TestAFailedJobIsReportedWithItsCause(t *testing.T) {
+	want := errors.New("executor exploded")
+	s := &fakeStore{lease: oneJob("j1")}
+	d := newTestDispatcher(t, s, runnerFunc(func(context.Context, job.Job) error { return want }))
+
+	stop := run(t, d)
+	defer stop()
+
+	waitFor(t, func() bool { return len(s.failedIDs()) > 0 })
+	if got := s.failCause(); !errors.Is(got, want) {
+		t.Errorf("Fail got cause %v, want %v", got, want)
+	}
+}
+
+// The bound is the difference between a backlog and an OOM.
+func TestNeverMoreThanMaxInFlight(t *testing.T) {
+	var running, peak atomic.Int64
+	release := make(chan struct{})
+
+	s := &fakeStore{lease: manyJobs(50)}
+	d := newTestDispatcher(t, s, runnerFunc(func(context.Context, job.Job) error {
+		n := running.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		<-release
+		running.Add(-1)
+		return nil
+	}))
+	d.cfg.MaxInFlight = 3
+
+	stop := run(t, d)
+	waitFor(t, func() bool { return running.Load() == 3 })
+	close(release)
+	stop()
+
+	if peak.Load() > 3 {
+		t.Errorf("%d jobs ran at once, want at most 3", peak.Load())
+	}
+}
+
+// Shutdown must reach the running job, or a deploy waits for the longest job
+// in the queue instead of asking it to stop.
+func TestShutdownCancelsARunningJob(t *testing.T) {
+	started := make(chan struct{})
+	var sawCancel atomic.Bool
+
+	s := &fakeStore{lease: oneJob("j1")}
+	d := newTestDispatcher(t, s, runnerFunc(func(ctx context.Context, _ job.Job) error {
+		close(started)
+		<-ctx.Done()
+		sawCancel.Store(true)
+		return ctx.Err()
+	}))
+
+	stop := run(t, d)
+	<-started
+	stop() // cancels, and asserts Run returns
+
+	if !sawCancel.Load() {
+		t.Error("the running job's context was never cancelled")
+	}
+}
+
+// A job that finishes as the process is shutting down has still finished. Its
+// result must be recorded, not lost to the cancelled context that ended it.
+//
+// RED until runOne records Complete/Fail on a detached context
+// (context.WithoutCancel): the recording call inherits the cancelled ctx and
+// the fake refuses it, faithfully mirroring pgx.
+func TestAJobFinishingDuringShutdownIsStillRecorded(t *testing.T) {
+	started := make(chan struct{})
+	s := &fakeStore{lease: oneJob("j1")}
+	d := newTestDispatcher(t, s, runnerFunc(func(ctx context.Context, _ job.Job) error {
+		close(started)
+		<-ctx.Done()
+		return nil // finished successfully, just as the world ended
+	}))
+
+	stop := run(t, d)
+	<-started
+	stop()
+
+	if ids := s.completedIDs(); len(ids) != 1 {
+		t.Errorf("completed %v, want j1 recorded despite the cancellation", ids)
+	}
+}
+
+// One job panicking must not take the process — or any other job — down.
+//
+// RED until runOne recovers panics and converts them into a returned error:
+// an unrecovered panic in the runner goroutine kills the whole test binary.
+// This test is deliberately last so the crash cannot mask the results above.
+func TestAPanickingJobBecomesAFailure(t *testing.T) {
+	s := &fakeStore{lease: oneJob("j1")}
+	d := newTestDispatcher(t, s, runnerFunc(func(context.Context, job.Job) error {
+		panic("boom")
+	}))
+
+	stop := run(t, d)
+	defer stop()
+
+	waitFor(t, func() bool { return len(s.failedIDs()) > 0 })
+	if got := s.failCause(); got == nil || !strings.Contains(got.Error(), "boom") {
+		t.Errorf("Fail got cause %v, want one mentioning the panic", got)
+	}
+}
