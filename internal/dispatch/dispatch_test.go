@@ -40,7 +40,9 @@ type fakeStore struct {
 	renewed   []string
 	complete  []string
 	failed    []string
-	lastCause error // cause passed to the most recent Fail call
+	lastCause error               // cause passed to the most recent Fail call
+	reap      func() (int, error) // nil means "nothing expired"
+	reaps     int
 }
 
 // Every method starts by refusing a cancelled context. pgx does this — a query on a
@@ -128,6 +130,25 @@ func (f *fakeStore) renewedIDs() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.renewed)
+}
+
+func (f *fakeStore) ReapExpired(ctx context.Context) (int, error) {
+	if err := refused(ctx); err != nil {
+		return 0, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reaps++
+	if f.reap == nil {
+		return 0, nil
+	}
+	return f.reap()
+}
+
+func (f *fakeStore) reapCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reaps
 }
 
 // failCause reports the cause the dispatcher handed to the most recent Fail.
@@ -471,4 +492,36 @@ func TestLosingTheLeaseCancelsTheJob(t *testing.T) {
 	if got, _ := cause.Load().(error); !errors.Is(got, ErrLeaseLost) {
 		t.Errorf("job was cancelled with %v, want ErrLeaseLost", got)
 	}
+}
+
+var noopRunner = runnerFunc(func(context.Context, job.Job) error { return nil })
+
+func TestReapRunsOnItsTicker(t *testing.T) {
+	s := &fakeStore{}
+	d := newTestDispatcher(t, s, noopRunner)
+	d.cfg.ReapInterval = time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	// Exits on cancel below.
+	go func() { errc <- d.Reap(ctx) }()
+
+	waitFor(t, func() bool { return s.reapCount() >= 3 })
+	cancel()
+	if err := <-errc; err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("Reap returned %v", err)
+	}
+}
+
+func TestReapSurvivesAnError(t *testing.T) {
+	s := &fakeStore{reap: func() (int, error) { return 0, errors.New("connection refused") }}
+	d := newTestDispatcher(t, s, noopRunner)
+	d.cfg.ReapInterval = time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Exits on the deferred cancel.
+	go func() { _ = d.Reap(ctx) }()
+
+	waitFor(t, func() bool { return s.reapCount() >= 3 })
 }

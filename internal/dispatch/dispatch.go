@@ -19,6 +19,7 @@ type Store interface {
 	Renew(ctx context.Context, id, leasedBy string, d time.Duration) error
 	Complete(ctx context.Context, id, leasedBy string, state job.State, message string) error
 	Fail(ctx context.Context, id, leasedBy string, cause error, p job.Policy) (job.Decision, error)
+	ReapExpired(ctx context.Context) (int, error)
 }
 
 // Runner executes one job. Phase 9 replaces the local implementation with
@@ -176,6 +177,33 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 
 		case <-ctx.Done():
 			return g.Wait()
+		}
+	}
+}
+
+func (d *Dispatcher) reapTurn(ctx context.Context) int {
+	reaped, err := d.store.ReapExpired(ctx)
+	if err != nil {
+		d.log.Error("reap failed", "err", err)
+		return 0
+	}
+	if reaped > 0 {
+		d.log.Info("reaped expired leases", "count", reaped)
+	}
+	return reaped
+}
+
+func (d *Dispatcher) Reap(ctx context.Context) error {
+	tk := time.NewTicker(d.cfg.ReapInterval)
+	defer tk.Stop()
+
+	for {
+		if d.reapTurn(ctx) == 0 {
+			select {
+			case <-tk.C:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 	}
 }
