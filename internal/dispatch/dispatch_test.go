@@ -35,6 +35,7 @@ type fakeStore struct {
 	mu sync.Mutex
 
 	lease     func(n int) ([]job.Job, error) // nil means "no work"
+	renew     func(id string) error          // nil means "renewal succeeds"
 	leases    int
 	renewed   []string
 	complete  []string
@@ -67,8 +68,12 @@ func (f *fakeStore) Renew(ctx context.Context, id, _ string, _ time.Duration) er
 		return err
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.renewed = append(f.renewed, id)
+	hook := f.renew
+	f.mu.Unlock()
+	if hook != nil {
+		return hook(id)
+	}
 	return nil
 }
 
@@ -144,6 +149,18 @@ func (f runnerFunc) Run(ctx context.Context, j job.Job) error { return f(ctx, j)
 func oneJob(id string) func(int) ([]job.Job, error) {
 	return func(n int) ([]job.Job, error) {
 		if n <= 0 {
+			return nil, nil
+		}
+		return []job.Job{{ID: id, State: job.Leased}}, nil
+	}
+}
+
+// onceOneJob hands out id on the first call only; every later call sees an
+// empty queue. Use it when a test must prove something stops after one job.
+func onceOneJob(id string) func(int) ([]job.Job, error) {
+	var done atomic.Bool
+	return func(n int) ([]job.Job, error) {
+		if n <= 0 || !done.CompareAndSwap(false, true) {
 			return nil, nil
 		}
 		return []job.Job{{ID: id, State: job.Leased}}, nil
@@ -394,5 +411,64 @@ func TestAPanickingJobBecomesAFailure(t *testing.T) {
 	waitFor(t, func() bool { return len(s.failedIDs()) > 0 })
 	if got := s.failCause(); got == nil || !strings.Contains(got.Error(), "boom") {
 		t.Errorf("Fail got cause %v, want one mentioning the panic", got)
+	}
+}
+
+func TestALongJobHasItsLeaseRenewed(t *testing.T) {
+	release := make(chan struct{})
+	s := &fakeStore{lease: oneJob("j1")}
+	d := newTestDispatcher(t, s, runnerFunc(func(context.Context, job.Job) error {
+		<-release
+		return nil
+	}))
+	d.cfg.Lease = 30 * time.Millisecond // renews every 10ms
+
+	stop := run(t, d)
+	waitFor(t, func() bool { return len(s.renewedIDs()) >= 2 })
+	close(release)
+	stop()
+}
+
+// The renewal goroutine is per job. If it outlives the job, a dispatcher that
+// has run a million jobs has a million tickers.
+func TestRenewalStopsWhenTheJobFinishes(t *testing.T) {
+	s := &fakeStore{lease: onceOneJob("j1")} // hands out j1 exactly once
+	d := newTestDispatcher(t, s, runnerFunc(func(context.Context, job.Job) error { return nil }))
+	d.cfg.Lease = 30 * time.Millisecond
+
+	stop := run(t, d)
+	defer stop()
+
+	waitFor(t, func() bool { return len(s.completedIDs()) == 1 })
+	after := len(s.renewedIDs())
+
+	// Proving a negative: no renewals for a job that is over.
+	time.Sleep(100 * time.Millisecond)
+	if got := len(s.renewedIDs()); got != after {
+		t.Errorf("renewals continued after the job finished: %d -> %d", after, got)
+	}
+}
+
+// Losing the lease means someone else owns this job now. Continuing to run it
+// produces a result we are not allowed to record.
+func TestLosingTheLeaseCancelsTheJob(t *testing.T) {
+	var cause atomic.Value
+	s := &fakeStore{
+		lease: oneJob("j1"),
+		renew: func(string) error { return fmt.Errorf("%w: j1", job.ErrNotFound) },
+	}
+	d := newTestDispatcher(t, s, runnerFunc(func(ctx context.Context, _ job.Job) error {
+		<-ctx.Done()
+		cause.Store(context.Cause(ctx))
+		return ctx.Err()
+	}))
+	d.cfg.Lease = 30 * time.Millisecond
+
+	stop := run(t, d)
+	waitFor(t, func() bool { return cause.Load() != nil })
+	stop()
+
+	if got, _ := cause.Load().(error); !errors.Is(got, ErrLeaseLost) {
+		t.Errorf("job was cancelled with %v, want ErrLeaseLost", got)
 	}
 }

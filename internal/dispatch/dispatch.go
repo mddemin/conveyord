@@ -2,6 +2,7 @@ package dispatch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -77,13 +78,44 @@ func (d *Dispatcher) runOne(ctx context.Context, j job.Job) {
 		}
 	}()
 
+	jctx, cancelJob := context.WithCancelCause(ctx)
+	defer cancelJob(nil)
+
+	go func() {
+		renewCtx, cancelRenew := context.WithCancel(jctx)
+		defer cancelRenew()
+
+		tk := time.NewTicker(d.cfg.Lease / 3)
+		defer tk.Stop()
+		for {
+			select {
+			case <-tk.C:
+				if err := d.store.Renew(renewCtx, j.ID, d.cfg.Name, d.cfg.Lease); err != nil {
+					if renewCtx.Err() != nil {
+						return // job finished or dispatcher shutting down; not a lease event
+					}
+					cancelJob(fmt.Errorf("%w: %v", ErrLeaseLost, err)) // someone else owns j.ID now
+					return
+				}
+			case <-renewCtx.Done():
+				return
+			}
+		}
+	}()
+
 	recCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 
-	err := d.safeRun(ctx, j)
+	err := d.safeRun(jctx, j)
 	if err != nil {
+		if c := context.Cause(jctx); errors.Is(c, ErrLeaseLost) {
+			err = fmt.Errorf("%w: %w", err, c) // both chains survive errors.Is
+		}
 		_, err := d.store.Fail(recCtx, j.ID, d.cfg.Name, err, d.cfg.Policy)
 		if err != nil {
+			if errors.Is(err, job.ErrNotFound) {
+				d.log.Debug("fail failed", "err", err)
+			}
 			d.log.Error("fail failed", "err", err)
 		}
 		return
