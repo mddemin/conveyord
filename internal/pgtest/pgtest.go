@@ -29,6 +29,10 @@ const DSNEnv = "CONVEYOR_TEST_DSN"
 // uses. It is nil under -short, where Run never starts a container.
 var pool *pgxpool.Pool
 
+// dsn is the connection string behind pool, exposed through [DSN] for code
+// under test that opens its own connections instead of taking Pool.
+var dsn string
+
 // Run boots Postgres, runs the package's tests, and tears it down. Call it
 // from TestMain and pass the result to os.Exit:
 //
@@ -63,12 +67,23 @@ func Pool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+// DSN returns the test database's connection string, for code under test
+// that opens its own connections instead of taking Pool.
+func DSN(t *testing.T) string {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	return dsn
+}
+
 // runWithPostgres exists so that every defer runs before the caller's os.Exit.
 // os.Exit in TestMain skips deferred calls, which would leak the container.
 func runWithPostgres(m *testing.M) (int, error) {
 	ctx := context.Background()
 
-	if dsn := os.Getenv(DSNEnv); dsn != "" {
+	if d := os.Getenv(DSNEnv); d != "" {
+		dsn = d
 		var err error
 		pool, err = pgxpool.New(ctx, dsn)
 		if err != nil {
@@ -101,7 +116,7 @@ func runWithPostgres(m *testing.M) (int, error) {
 		}
 	}()
 
-	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
+	dsn, err = container.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
 		return 0, fmt.Errorf("connection string: %w", err)
 	}
