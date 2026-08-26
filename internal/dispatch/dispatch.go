@@ -1,3 +1,8 @@
+// Package dispatch turns the queue into a moving system: it leases pending
+// jobs, runs them through a Runner, renews their leases, records outcomes,
+// and returns expired leases to pending. It depends on the Store behaviour
+// declared here — never on internal/store — so tests run without Postgres
+// and phase 9 can swap local execution for agent assignment unchanged.
 package dispatch
 
 import (
