@@ -15,6 +15,7 @@ import (
 
 	"github.com/mddemin/conveyor/internal/hub"
 	"github.com/mddemin/conveyor/internal/job"
+	"go.uber.org/goleak"
 )
 
 func newTestAPI(t *testing.T, store Store) *API {
@@ -136,3 +137,5 @@ func TestWriteErrorKeepsDomainDetail(t *testing.T) {
 		t.Errorf("404 body dropped the job id: %s", w.Body)
 	}
 }
+
+func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }

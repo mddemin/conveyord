@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mddemin/conveyor/internal/job"
+	"go.uber.org/goleak"
 )
 
 func waitFor(t *testing.T, cond func() bool) {
@@ -525,3 +526,5 @@ func TestReapSurvivesAnError(t *testing.T) {
 
 	waitFor(t, func() bool { return s.reapCount() >= 3 })
 }
+
+func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }

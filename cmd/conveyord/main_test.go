@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -19,9 +20,20 @@ import (
 	"github.com/mddemin/conveyor/internal/job"
 	"github.com/mddemin/conveyor/internal/pgtest"
 	"github.com/mddemin/conveyor/internal/store"
+	"go.uber.org/goleak"
 )
 
-func TestMain(m *testing.M) { os.Exit(pgtest.Run(m)) }
+func TestMain(m *testing.M) {
+	code := pgtest.Run(m)
+	if err := goleak.Find(
+		goleak.IgnoreTopFunction("github.com/jackc/pgx/v5/pgxpool.(*Pool).backgroundHealthCheck"), // pgx pool keeps one health-check goroutine per process by design
+		// testcontainers' reaper exits with its container, torn down inside pgtest.Run
+	); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		code = 1
+	}
+	os.Exit(code)
+}
 
 // freshDB returns a Store publishing to events. The hub is a parameter rather
 // than an internal detail because the end-to-end tests need the same hub the
@@ -127,6 +139,15 @@ func TestEnqueueAndReadBackOverHTTP(t *testing.T) {
 // while it is genuinely mid-flight.
 func TestSIGTERMDrainsAnInFlightJob(t *testing.T) {
 	dsn := pgtest.DSN(t)
+	// Order independence: earlier tests' rows must not leak into this test's
+	// verdict read, which targets its own job ID but assumes a clean table.
+	pool := pgtest.Pool(t)
+	if err := store.Migrate(t.Context(), pool); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if _, err := pool.Exec(t.Context(), `TRUNCATE jobs, job_events RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(t.Context())
 	errc := make(chan error, 1)

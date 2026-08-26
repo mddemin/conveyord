@@ -10,9 +10,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -23,6 +25,11 @@ import (
 // container. Point it at a local docker compose and the whole suite skips
 // container startup; leave it unset in CI and every package gets a clean,
 // isolated database.
+//
+// Each test process runs in its own schema (pgtest_<pid>) inside the shared
+// database: packages run as concurrent processes and their tests TRUNCATE
+// tables, so without namespacing one package's freshDB deletes another's
+// fixtures mid-test. The schema is dropped when the process finishes.
 const DSNEnv = "CONVEYOR_TEST_DSN"
 
 // pool is the connection pool every integration test in the importing package
@@ -77,25 +84,54 @@ func DSN(t *testing.T) string {
 	return dsn
 }
 
+// withSearchPath appends a search_path runtime parameter to a DSN.
+func withSearchPath(dsn, schema string) string {
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	return dsn + sep + "options=-c%20search_path%3D" + schema
+}
+
 // runWithPostgres exists so that every defer runs before the caller's os.Exit.
 // os.Exit in TestMain skips deferred calls, which would leak the container.
 func runWithPostgres(m *testing.M) (int, error) {
 	ctx := context.Background()
 
 	if d := os.Getenv(DSNEnv); d != "" {
-		dsn = d
-		var err error
-		pool, err = pgxpool.New(ctx, dsn)
+		schema := fmt.Sprintf("pgtest_%d", os.Getpid())
+		dsn = withSearchPath(d, schema)
+		// Create the schema on a plain connection: the pool below routes
+		// everything into it via search_path.
+		conn, err := pgx.Connect(ctx, d)
+		if err != nil {
+			return 0, fmt.Errorf("opening connection for %s: %w", DSNEnv, err)
+		}
+		if _, err := conn.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, schema)); err != nil {
+			conn.Close(ctx)
+			return 0, fmt.Errorf("creating schema %s: %w", schema, err)
+		}
+		conn.Close(ctx)
+
+		pool, err = pgxpool.New(ctx, withSearchPath(d, schema))
 		if err != nil {
 			return 0, fmt.Errorf("opening pool for %s: %w", DSNEnv, err)
 		}
-		defer pool.Close()
 		// Fail here rather than in every test: an unreachable DSN in the
 		// environment is a setup mistake, not a test failure.
 		if err := pool.Ping(ctx); err != nil {
 			return 0, fmt.Errorf("pinging %s: %w", DSNEnv, err)
 		}
-		return m.Run(), nil
+
+		code := m.Run()
+
+		// Drop our schema before closing the pool, so a shared dev database
+		// does not accumulate an abandoned pgtest_<pid> per run.
+		if _, err := pool.Exec(ctx, fmt.Sprintf(`DROP SCHEMA IF EXISTS %s CASCADE`, schema)); err != nil {
+			fmt.Fprintln(os.Stderr, "pgtest: dropping schema:", err)
+		}
+		pool.Close()
+		return code, nil
 	}
 
 	container, err := tcpostgres.Run(ctx, "postgres:17-alpine",

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/mddemin/conveyor/internal/job"
+	"go.uber.org/goleak"
 )
 
 func TestSubscribeReceivesAPublishedEvent(t *testing.T) {
@@ -252,3 +253,5 @@ func TestConcurrentUse(t *testing.T) {
 		t.Errorf("Len is %d after every subscriber closed, want 0", h.Len())
 	}
 }
+
+func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }

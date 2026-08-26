@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"os"
 	"slices"
 	"sync"
@@ -8,9 +9,19 @@ import (
 
 	"github.com/mddemin/conveyor/internal/job"
 	"github.com/mddemin/conveyor/internal/pgtest"
+	"go.uber.org/goleak"
 )
 
-func TestMain(m *testing.M) { os.Exit(pgtest.Run(m)) }
+func TestMain(m *testing.M) {
+	code := pgtest.Run(m)
+	if err := goleak.Find(
+		goleak.IgnoreTopFunction("github.com/jackc/pgx/v5/pgxpool.(*Pool).backgroundHealthCheck"),
+	); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		code = 1
+	}
+	os.Exit(code)
+}
 
 // capturePublisher records what a Store published, so a test can assert on
 // the events a write produced without standing up a real hub. Locked because

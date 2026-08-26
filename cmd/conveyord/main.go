@@ -119,6 +119,10 @@ func serve(srv *http.Server, ln net.Listener) error {
 	return err
 }
 
+// run wires the whole daemon and blocks until shutdown completes. Ordering
+// contract: the pool is created first and closed last (deferred); everything
+// long-lived is an errgroup member cancelled by gctx; streaming handlers die
+// through baseCtx before Shutdown drains them.
 func run(ctx context.Context, args []string, log *slog.Logger, stop context.CancelFunc, onListen func(net.Addr)) error {
 	dsnEnv := os.Getenv("CONVEYOR_DSN")
 
@@ -183,7 +187,7 @@ func run(ctx context.Context, args []string, log *slog.Logger, stop context.Canc
 	g.Go(func() error { return serve(srv, ln) }) // returns nil on ErrServerClosed
 	g.Go(func() error { return d.Run(gctx) })
 	g.Go(func() error { return d.Reap(gctx) })
-	g.Go(func() error { // the shutdown sequencer
+	g.Go(func() error { // shutdown sequencer. Owner: this group. Stop: gctx. Error: Shutdown's result.
 		<-gctx.Done()
 		stop() // a second signal now kills us
 		// baseCtx is a child of gctx and is already cancelled here, so every

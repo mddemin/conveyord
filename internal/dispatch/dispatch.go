@@ -37,6 +37,11 @@ type Config struct {
 	Policy       job.Policy
 }
 
+// Dispatcher leases jobs from a Store and runs them locally through a
+// Runner, holding at most cfg.MaxInFlight leases at once. It exposes two
+// blocking loops, Run and Reap; neither starts goroutines that outlive them,
+// and both expect the caller to close shared resources (the pool) only after
+// they have returned.
 type Dispatcher struct {
 	store     Store
 	runner    Runner
@@ -46,10 +51,17 @@ type Dispatcher struct {
 	inFlight  atomic.Int64
 }
 
+// New returns a dispatcher ready to Run and Reap. slotFreed starts empty:
+// tokens appear only when workers finish, and the wait loop recomputes free
+// capacity from inFlight on every wake, so a dropped token costs latency
+// once, never correctness.
 func New(store Store, runner Runner, log *slog.Logger, cfg Config) *Dispatcher {
 	return &Dispatcher{store: store, runner: runner, log: log, cfg: cfg, slotFreed: make(chan struct{}, 1)}
 }
 
+// safeRun runs one job, converting a panicking runner into an ordinary
+// error. The recover boundary sits only around the runner: a panic in the
+// store or the recording path is a bug in this package and must crash loud.
 func (d *Dispatcher) safeRun(ctx context.Context, j job.Job) (err error) {
 	defer func() {
 		v := recover()
@@ -70,8 +82,23 @@ func (d *Dispatcher) safeRun(ctx context.Context, j job.Job) (err error) {
 	return d.runner.Run(ctx, j)
 }
 
+// runOne runs j to completion and records the outcome. Context roles:
+//
+//	jctx     the job's kill switch; the runner runs on it. Cancelled with an
+//	         ErrLeaseLost cause when the lease changes hands, by the parent
+//	         on shutdown, and by the deferred cancelJob on any exit.
+//	renewCtx the renewal pump's handle; a child of jctx so the pump stops
+//	         the moment the job does, without inventing a second reason for
+//	         the runner to stop.
+//	recCtx   detached from cancellation: a result recorded during shutdown
+//	         is still recorded, because pgx refuses writes on a cancelled
+//	         context and the job's outcome would be lost to the reaper.
 func (d *Dispatcher) runOne(ctx context.Context, j job.Job) {
 	defer func() {
+		// Decrement BEFORE signalling: the decrement then happens-before the
+		// woken pass's read of inFlight, so a reloop never sees a stale count
+		// and over-leases. Reversed order can leave the loop asleep with no
+		// token coming — a hang at MaxInFlight=1.
 		d.inFlight.Add(-1)
 		select {
 		case d.slotFreed <- struct{}{}: // leave a token for the sleeping loop
@@ -82,6 +109,10 @@ func (d *Dispatcher) runOne(ctx context.Context, j job.Job) {
 	jctx, cancelJob := context.WithCancelCause(ctx)
 	defer cancelJob(nil)
 
+	// The renewal pump. Owner: this runOne invocation. Stop signal:
+	// renewCtx, closed whenever jctx closes. Its errors are not logged and
+	// retried — losing the lease means stop working now, so they become the
+	// job's cancellation cause.
 	go func() {
 		renewCtx, cancelRenew := context.WithCancel(jctx)
 		defer cancelRenew()
@@ -113,10 +144,11 @@ func (d *Dispatcher) runOne(ctx context.Context, j job.Job) {
 			err = fmt.Errorf("%w: %w", err, c) // both chains survive errors.Is
 		}
 		_, err := d.store.Fail(recCtx, j.ID, d.cfg.Name, err, d.cfg.Policy)
-		if err != nil {
-			if errors.Is(err, job.ErrNotFound) {
-				d.log.Debug("fail failed", "err", err)
-			}
+		if errors.Is(err, job.ErrNotFound) {
+			// Expected exactly when the lease changed hands mid-job: the new
+			// owner owns the row, our write lands as zero rows. Not noise.
+			d.log.Debug("fail failed", "err", err)
+		} else {
 			d.log.Error("fail failed", "err", err)
 		}
 		return
@@ -129,6 +161,11 @@ func (d *Dispatcher) runOne(ctx context.Context, j job.Job) {
 	}
 }
 
+// runTurn leases up to the free capacity and submits each lease to g at
+// once. Because free is capped by inFlight, g.Go never blocks here — the
+// loop stays watching ctx.Done(). It returns true when every requested slot
+// was filled; the caller reads a full batch as "probably more work" and
+// turns straight around instead of waiting for the ticker.
 func (d *Dispatcher) runTurn(ctx context.Context, g *errgroup.Group) bool {
 	free := d.cfg.MaxInFlight - int(d.inFlight.Load())
 	for free <= 0 {
@@ -149,6 +186,9 @@ func (d *Dispatcher) runTurn(ctx context.Context, g *errgroup.Group) bool {
 	}
 	for _, j := range leased {
 		d.inFlight.Add(1)
+		// Counts leases held, not goroutines started: incrementing here,
+		// synchronously with the lease decision, leaves the scheduler no gap
+		// in which a reloop could read a stale count.
 		g.Go(func() error {
 			d.runOne(ctx, j)
 			return nil
@@ -158,7 +198,10 @@ func (d *Dispatcher) runTurn(ctx context.Context, g *errgroup.Group) bool {
 	return full
 }
 
-// Run polls until ctx is cancelled, then returns after in-flight jobs finish.
+// Run polls until ctx is cancelled, then drains: it stops leasing and waits
+// for in-flight jobs to record their results. Returns nil on a clean cancel
+// (workers always report success to the group); a non-nil return is a real
+// failure worth exiting over.
 func (d *Dispatcher) Run(ctx context.Context) error {
 	tk := time.NewTicker(d.cfg.Interval)
 	defer tk.Stop()
@@ -181,6 +224,11 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 	}
 }
 
+// reapTurn runs one reaper pass. A nonzero count is logged at Info and
+// returned so the caller can turn straight around: the store caps a pass at
+// DefaultLimit, so a large backlog drains over consecutive passes rather
+// than consecutive ticks. Quiet passes log nothing — a reaper that logs its
+// idle ticks teaches operators to ignore its output.
 func (d *Dispatcher) reapTurn(ctx context.Context) int {
 	reaped, err := d.store.ReapExpired(ctx)
 	if err != nil {
@@ -193,6 +241,9 @@ func (d *Dispatcher) reapTurn(ctx context.Context) int {
 	return reaped
 }
 
+// Reap returns expired leases to pending on a slow ticker until ctx is
+// cancelled, then returns ctx.Err(). Deliberately a separate loop from Run:
+// the recovery path must keep running precisely when leasing is saturated.
 func (d *Dispatcher) Reap(ctx context.Context) error {
 	tk := time.NewTicker(d.cfg.ReapInterval)
 	defer tk.Stop()
