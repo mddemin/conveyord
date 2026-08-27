@@ -27,6 +27,7 @@ jobs:
     env:
       CONVEYOR_TEST_DSN: postgres://conveyor:conveyor@127.0.0.1:5432/conveyor?sslmode=disable
 
+
     steps:
       - uses: actions/checkout@v4
 
@@ -38,14 +39,20 @@ jobs:
         run: go vet ./...
 
       - name: staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@latest -checks=all ./...
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest -checks=all $$(go list ./... | grep -v '/gen/')
 
       - name: gofmt
         run: |
-          unformatted=$(gofmt -l .)
+          unformatted=$(gofmt -l . | grep -v '^gen/')
           if [ -n "$unformatted" ]; then
             echo "gofmt needed:"; echo "$unformatted"; exit 1
           fi
+
+      - name: proto lint
+        run: go tool buf lint
+
+      - name: proto breaking check
+        run: go tool buf breaking proto --against '.git#branch=main,subdir=proto'
 
       - name: test
         run: go test -race ./...
