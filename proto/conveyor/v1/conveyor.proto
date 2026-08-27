@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package conveyor.v1;
+
+option go_package = "github.com/mddemin/conveyor/gen/conveyor/v1;conveyorv1";
+
+// ServerToAgent is one frame pushed to an agent's open stream.
+message ServerToAgent {
+  oneof payload {
+    // Assignment hands the agent a job it now holds a server-side lease on.
+    Assignment assignment = 1;
+
+    // CancelJob asks the agent to stop a job it is running. Best effort:
+    // the lease expiring is the real deadline.
+    CancelJob cancel_job = 3;
+  }
+}
+
+message Assignment {
+  string job_id = 1;
+  string type = 2; // selects the executor agent-side
+  bytes payload = 3; // opaque to the queue, meaningful to the executor
+}
+
+message CancelJob {
+  string job_id = 1;
+}
+
+// AgentToServer is one frame an agent sends up its open stream.
+message AgentToServer {
+  oneof payload {
+    Heartbeat heartbeat = 1; // liveness only; carries nothing yet
+    Progress progress = 5; // advisory, never persisted in phase 8
+    Result result = 6; // terminal: success iff error is empty
+  }
+}
+
+message Heartbeat {}
+
+message Progress {
+  string job_id = 1;
+  string message = 2;
+}
+
+message Result {
+  string job_id = 1;
+  string error = 2; // empty means success
+}
