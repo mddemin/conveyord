@@ -217,6 +217,7 @@ type AgentToServer struct {
 	// Types that are valid to be assigned to Payload:
 	//
 	//	*AgentToServer_Heartbeat
+	//	*AgentToServer_Register
 	//	*AgentToServer_Progress
 	//	*AgentToServer_Result
 	Payload       isAgentToServer_Payload `protobuf_oneof:"payload"`
@@ -270,6 +271,15 @@ func (x *AgentToServer) GetHeartbeat() *Heartbeat {
 	return nil
 }
 
+func (x *AgentToServer) GetRegister() *Register {
+	if x != nil {
+		if x, ok := x.Payload.(*AgentToServer_Register); ok {
+			return x.Register
+		}
+	}
+	return nil
+}
+
 func (x *AgentToServer) GetProgress() *Progress {
 	if x != nil {
 		if x, ok := x.Payload.(*AgentToServer_Progress); ok {
@@ -293,18 +303,24 @@ type isAgentToServer_Payload interface {
 }
 
 type AgentToServer_Heartbeat struct {
-	Heartbeat *Heartbeat `protobuf:"bytes,1,opt,name=heartbeat,proto3,oneof"` // liveness only; carries nothing yet
+	Heartbeat *Heartbeat `protobuf:"bytes,1,opt,name=heartbeat,proto3,oneof"`
+}
+
+type AgentToServer_Register struct {
+	Register *Register `protobuf:"bytes,2,opt,name=register,proto3,oneof"`
 }
 
 type AgentToServer_Progress struct {
-	Progress *Progress `protobuf:"bytes,5,opt,name=progress,proto3,oneof"` // advisory, never persisted in phase 8
+	Progress *Progress `protobuf:"bytes,5,opt,name=progress,proto3,oneof"`
 }
 
 type AgentToServer_Result struct {
-	Result *Result `protobuf:"bytes,6,opt,name=result,proto3,oneof"` // terminal: success iff error is empty
+	Result *Result `protobuf:"bytes,6,opt,name=result,proto3,oneof"`
 }
 
 func (*AgentToServer_Heartbeat) isAgentToServer_Payload() {}
+
+func (*AgentToServer_Register) isAgentToServer_Payload() {}
 
 func (*AgentToServer_Progress) isAgentToServer_Payload() {}
 
@@ -450,6 +466,58 @@ func (x *Result) GetError() string {
 	return ""
 }
 
+type Register struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	AgentId       string                 `protobuf:"bytes,1,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"` // client-chosen, e.g. "host-pid"
+	Capabilities  []string               `protobuf:"bytes,2,rep,name=capabilities,proto3" json:"capabilities,omitempty"`      // types this agent can execute; empty = any
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Register) Reset() {
+	*x = Register{}
+	mi := &file_conveyor_v1_conveyor_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Register) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Register) ProtoMessage() {}
+
+func (x *Register) ProtoReflect() protoreflect.Message {
+	mi := &file_conveyor_v1_conveyor_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Register.ProtoReflect.Descriptor instead.
+func (*Register) Descriptor() ([]byte, []int) {
+	return file_conveyor_v1_conveyor_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *Register) GetAgentId() string {
+	if x != nil {
+		return x.AgentId
+	}
+	return ""
+}
+
+func (x *Register) GetCapabilities() []string {
+	if x != nil {
+		return x.Capabilities
+	}
+	return nil
+}
+
 var File_conveyor_v1_conveyor_proto protoreflect.FileDescriptor
 
 const file_conveyor_v1_conveyor_proto_rawDesc = "" +
@@ -468,9 +536,10 @@ const file_conveyor_v1_conveyor_proto_rawDesc = "" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12\x18\n" +
 	"\apayload\x18\x03 \x01(\fR\apayload\"\"\n" +
 	"\tCancelJob\x12\x15\n" +
-	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\xb6\x01\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\xeb\x01\n" +
 	"\rAgentToServer\x126\n" +
 	"\theartbeat\x18\x01 \x01(\v2\x16.conveyor.v1.HeartbeatH\x00R\theartbeat\x123\n" +
+	"\bregister\x18\x02 \x01(\v2\x15.conveyor.v1.RegisterH\x00R\bregister\x123\n" +
 	"\bprogress\x18\x05 \x01(\v2\x15.conveyor.v1.ProgressH\x00R\bprogress\x12-\n" +
 	"\x06result\x18\x06 \x01(\v2\x13.conveyor.v1.ResultH\x00R\x06resultB\t\n" +
 	"\apayload\"\v\n" +
@@ -480,7 +549,12 @@ const file_conveyor_v1_conveyor_proto_rawDesc = "" +
 	"\amessage\x18\x02 \x01(\tR\amessage\"5\n" +
 	"\x06Result\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05errorB8Z6github.com/mddemin/conveyor/gen/conveyor/v1;conveyorv1b\x06proto3"
+	"\x05error\x18\x02 \x01(\tR\x05error\"I\n" +
+	"\bRegister\x12\x19\n" +
+	"\bagent_id\x18\x01 \x01(\tR\aagentId\x12\"\n" +
+	"\fcapabilities\x18\x02 \x03(\tR\fcapabilities2P\n" +
+	"\bConveyor\x12D\n" +
+	"\x06Assign\x12\x1a.conveyor.v1.AgentToServer\x1a\x1a.conveyor.v1.ServerToAgent(\x010\x01B8Z6github.com/mddemin/conveyor/gen/conveyor/v1;conveyorv1b\x06proto3"
 
 var (
 	file_conveyor_v1_conveyor_proto_rawDescOnce sync.Once
@@ -494,7 +568,7 @@ func file_conveyor_v1_conveyor_proto_rawDescGZIP() []byte {
 	return file_conveyor_v1_conveyor_proto_rawDescData
 }
 
-var file_conveyor_v1_conveyor_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_conveyor_v1_conveyor_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_conveyor_v1_conveyor_proto_goTypes = []any{
 	(*ServerToAgent)(nil), // 0: conveyor.v1.ServerToAgent
 	(*Assignment)(nil),    // 1: conveyor.v1.Assignment
@@ -503,18 +577,22 @@ var file_conveyor_v1_conveyor_proto_goTypes = []any{
 	(*Heartbeat)(nil),     // 4: conveyor.v1.Heartbeat
 	(*Progress)(nil),      // 5: conveyor.v1.Progress
 	(*Result)(nil),        // 6: conveyor.v1.Result
+	(*Register)(nil),      // 7: conveyor.v1.Register
 }
 var file_conveyor_v1_conveyor_proto_depIdxs = []int32{
 	1, // 0: conveyor.v1.ServerToAgent.assignment:type_name -> conveyor.v1.Assignment
 	2, // 1: conveyor.v1.ServerToAgent.cancel_job:type_name -> conveyor.v1.CancelJob
 	4, // 2: conveyor.v1.AgentToServer.heartbeat:type_name -> conveyor.v1.Heartbeat
-	5, // 3: conveyor.v1.AgentToServer.progress:type_name -> conveyor.v1.Progress
-	6, // 4: conveyor.v1.AgentToServer.result:type_name -> conveyor.v1.Result
-	5, // [5:5] is the sub-list for method output_type
-	5, // [5:5] is the sub-list for method input_type
-	5, // [5:5] is the sub-list for extension type_name
-	5, // [5:5] is the sub-list for extension extendee
-	0, // [0:5] is the sub-list for field type_name
+	7, // 3: conveyor.v1.AgentToServer.register:type_name -> conveyor.v1.Register
+	5, // 4: conveyor.v1.AgentToServer.progress:type_name -> conveyor.v1.Progress
+	6, // 5: conveyor.v1.AgentToServer.result:type_name -> conveyor.v1.Result
+	3, // 6: conveyor.v1.Conveyor.Assign:input_type -> conveyor.v1.AgentToServer
+	0, // 7: conveyor.v1.Conveyor.Assign:output_type -> conveyor.v1.ServerToAgent
+	7, // [7:8] is the sub-list for method output_type
+	6, // [6:7] is the sub-list for method input_type
+	6, // [6:6] is the sub-list for extension type_name
+	6, // [6:6] is the sub-list for extension extendee
+	0, // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_conveyor_v1_conveyor_proto_init() }
@@ -528,6 +606,7 @@ func file_conveyor_v1_conveyor_proto_init() {
 	}
 	file_conveyor_v1_conveyor_proto_msgTypes[3].OneofWrappers = []any{
 		(*AgentToServer_Heartbeat)(nil),
+		(*AgentToServer_Register)(nil),
 		(*AgentToServer_Progress)(nil),
 		(*AgentToServer_Result)(nil),
 	}
@@ -537,9 +616,9 @@ func file_conveyor_v1_conveyor_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_conveyor_v1_conveyor_proto_rawDesc), len(file_conveyor_v1_conveyor_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   7,
+			NumMessages:   8,
 			NumExtensions: 0,
-			NumServices:   0,
+			NumServices:   1,
 		},
 		GoTypes:           file_conveyor_v1_conveyor_proto_goTypes,
 		DependencyIndexes: file_conveyor_v1_conveyor_proto_depIdxs,

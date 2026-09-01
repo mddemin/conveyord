@@ -29,9 +29,10 @@ message CancelJob {
 // AgentToServer is one frame an agent sends up its open stream.
 message AgentToServer {
   oneof payload {
-    Heartbeat heartbeat = 1; // liveness only; carries nothing yet
-    Progress progress = 5; // advisory, never persisted in phase 8
-    Result result = 6; // terminal: success iff error is empty
+    Heartbeat heartbeat = 1;
+    Register register = 2;
+    Progress progress = 5;
+    Result result = 6;
   }
 }
 
@@ -45,4 +46,16 @@ message Progress {
 message Result {
   string job_id = 1;
   string error = 2; // empty means success
+}
+
+// One long-lived stream per agent.
+service Conveyor {
+  // Assign is the agent's lifeline: the server pushes Assignments,
+  // the agent pushes Heartbeats/Progress/Results.
+  rpc Assign(stream AgentToServer) returns (stream ServerToAgent);
+}
+
+message Register {
+  string agent_id = 1; // client-chosen, e.g. "host-pid"
+  repeated string capabilities = 2; // types this agent can execute; empty = any
 }

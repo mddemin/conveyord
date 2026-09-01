@@ -70,6 +70,14 @@ func fixtures() []struct {
 				},
 			},
 		},
+		{
+			name: "agent_to_server_register",
+			msg: &pb.AgentToServer{
+				Payload: &pb.AgentToServer_Register{
+					Register: &pb.Register{AgentId: "a-1", Capabilities: []string{"rewrite", "log"}},
+				},
+			},
+		},
 	}
 }
 
