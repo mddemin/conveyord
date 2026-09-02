@@ -18,8 +18,9 @@ message ServerToAgent {
 
 message Assignment {
   string job_id = 1;
-  string type = 2; // selects the executor agent-side
-  bytes payload = 3; // opaque to the queue, meaningful to the executor
+  string type = 2;
+  bytes payload = 3;
+  int32 attempt = 4; // job.Job.Attempt at lease time; agents echo it verbatim
 }
 
 message CancelJob {
@@ -46,6 +47,7 @@ message Progress {
 message Result {
   string job_id = 1;
   string error = 2; // empty means success
+  int32 attempt = 3; // copied from the Assignment being reported
 }
 
 // One long-lived stream per agent.

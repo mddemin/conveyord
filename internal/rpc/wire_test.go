@@ -1,4 +1,4 @@
-package conveyorv1_test
+package rpc
 
 import (
 	"encoding/hex"
@@ -26,6 +26,7 @@ func fixtures() []struct {
 						JobId:   "j-1",
 						Type:    "resize",
 						Payload: []byte{0x01, 0x02},
+						Attempt: 1,
 					},
 				},
 			},
@@ -58,7 +59,7 @@ func fixtures() []struct {
 			name: "agent_to_server_result_success",
 			msg: &pb.AgentToServer{
 				Payload: &pb.AgentToServer_Result{
-					Result: &pb.Result{JobId: "j-4", Error: ""},
+					Result: &pb.Result{JobId: "j-4", Error: "", Attempt: 0},
 				},
 			},
 		},
@@ -66,7 +67,7 @@ func fixtures() []struct {
 			name: "agent_to_server_result_failure",
 			msg: &pb.AgentToServer{
 				Payload: &pb.AgentToServer_Result{
-					Result: &pb.Result{JobId: "j-5", Error: "oops"},
+					Result: &pb.Result{JobId: "j-5", Error: "oops", Attempt: 5},
 				},
 			},
 		},

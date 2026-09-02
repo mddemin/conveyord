@@ -110,8 +110,9 @@ func (*ServerToAgent_CancelJob) isServerToAgent_Payload() {}
 type Assignment struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
-	Type          string                 `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`       // selects the executor agent-side
-	Payload       []byte                 `protobuf:"bytes,3,opt,name=payload,proto3" json:"payload,omitempty"` // opaque to the queue, meaningful to the executor
+	Type          string                 `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`
+	Payload       []byte                 `protobuf:"bytes,3,opt,name=payload,proto3" json:"payload,omitempty"`
+	Attempt       int32                  `protobuf:"varint,4,opt,name=attempt,proto3" json:"attempt,omitempty"` // job.Job.Attempt at lease time; agents echo it verbatim
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -165,6 +166,13 @@ func (x *Assignment) GetPayload() []byte {
 		return x.Payload
 	}
 	return nil
+}
+
+func (x *Assignment) GetAttempt() int32 {
+	if x != nil {
+		return x.Attempt
+	}
+	return 0
 }
 
 type CancelJob struct {
@@ -417,7 +425,8 @@ func (x *Progress) GetMessage() string {
 type Result struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
-	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"` // empty means success
+	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`      // empty means success
+	Attempt       int32                  `protobuf:"varint,3,opt,name=attempt,proto3" json:"attempt,omitempty"` // copied from the Assignment being reported
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -464,6 +473,13 @@ func (x *Result) GetError() string {
 		return x.Error
 	}
 	return ""
+}
+
+func (x *Result) GetAttempt() int32 {
+	if x != nil {
+		return x.Attempt
+	}
+	return 0
 }
 
 type Register struct {
@@ -529,12 +545,13 @@ const file_conveyor_v1_conveyor_proto_rawDesc = "" +
 	"assignment\x127\n" +
 	"\n" +
 	"cancel_job\x18\x03 \x01(\v2\x16.conveyor.v1.CancelJobH\x00R\tcancelJobB\t\n" +
-	"\apayload\"Q\n" +
+	"\apayload\"k\n" +
 	"\n" +
 	"Assignment\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12\x18\n" +
-	"\apayload\x18\x03 \x01(\fR\apayload\"\"\n" +
+	"\apayload\x18\x03 \x01(\fR\apayload\x12\x18\n" +
+	"\aattempt\x18\x04 \x01(\x05R\aattempt\"\"\n" +
 	"\tCancelJob\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\xeb\x01\n" +
 	"\rAgentToServer\x126\n" +
@@ -546,10 +563,11 @@ const file_conveyor_v1_conveyor_proto_rawDesc = "" +
 	"\tHeartbeat\";\n" +
 	"\bProgress\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage\"5\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"O\n" +
 	"\x06Result\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05error\"I\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\x12\x18\n" +
+	"\aattempt\x18\x03 \x01(\x05R\aattempt\"I\n" +
 	"\bRegister\x12\x19\n" +
 	"\bagent_id\x18\x01 \x01(\tR\aagentId\x12\"\n" +
 	"\fcapabilities\x18\x02 \x03(\tR\fcapabilities2P\n" +
