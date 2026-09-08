@@ -67,6 +67,11 @@ func TestCloseAllWakesWaiters(t *testing.T) {
 	if n := len(r.List()); n != 1 {
 		t.Fatalf("CloseAll must not delete; handlers do: %d", n)
 	}
+	// Still in the map, and that is the point: an agent whose stream is going
+	// away must not be handed work during the drain.
+	if _, err := r.Assign(job.Job{ID: "j1", Type: "x"}); !errors.Is(err, ErrNoAgents) {
+		t.Fatalf("closed agent must not be assignable: %v", err)
+	}
 	r.Unregister(a) // idempotent close: this must not panic
 }
 

@@ -316,6 +316,12 @@ func TestCloseAllWakesWaiters(t *testing.T) {
   r.CloseAll()
   <-a.Done()
   if n := len(r.List()); n != 1 { t.Fatalf("CloseAll must not delete; handlers do: %d", n) }
+  // Still in the map, and that is the point: an agent whose stream is going
+  // away must not be handed work during the drain. Without the closed check in
+  // Assign this returns (a, nil) and every draining assignment is lost.
+  if _, err := r.Assign(job.Job{ID: "j1", Type: "x"}); !errors.Is(err, ErrNoAgents) {
+    t.Fatalf("closed agent must not be assignable: %v", err)
+  }
   r.Unregister(a) // idempotent close: this must not panic
 }
 
@@ -380,165 +386,69 @@ func TestSetCapabilitiesKeepsTheSameAgent(t *testing.T) {
 ### Shape
 
 ```go
+// The rule for this block: everything the verbatim tests name is declared
+// here, and nothing else is. sendPump, recvPump, await, forget and the
+// waiters key appear in no test, so they are yours to shape from the
+// requirements below. If a test references a name this block does not
+// declare, the block is wrong — that is how ErrAgentGone went missing once.
 type Server struct {
   pb.UnimplementedConveyorServer
   hub      Publisher // hub.Publish, same interface store.New takes
-  registry *Registry
+  registry *Registry // tests reach through this: s.registry.Register(...)
   log      *slog.Logger
 
   mu      sync.Mutex
-  waiters map[attemptKey]chan error // one attempt -> the Run goroutine blocked on its Result
-}
-
-// attemptKey identifies one unit of work. A job ID alone does not: a job
-// abandoned by ErrLeaseLost is re-leased while the previous agent is still
-// working on it, and phase 9 has no CancelJob to tell that agent to stop. See
-// Task 1's "why the attempt token exists".
-type attemptKey struct {
-  jobID   string
-  attempt int32
+  waiters map[???]chan error // keyed by job AND attempt — see requirements
 }
 
 type Publisher interface{ Publish(ev job.Event) }
 
 func NewServer(hub Publisher, reg *Registry, log *slog.Logger) *Server
 
-// Assign is the gRPC handler: one call per connected agent, two pumps.
+// Assign is the gRPC handler: one call per connected agent, two pumps. Its
+// presence is what satisfies pb.RegisterConveyorServer.
 func (s *Server) Assign(stream pb.Conveyor_AssignServer) error
 
 // Run satisfies dispatch.Runner. It hands j to an agent and blocks until that
-// agent reports a Result or ctx dies. Living here, not in package main, is what
-// makes it testable without Postgres or a real listener.
+// agent reports a Result, the agent disappears, or ctx dies. Living here, not
+// in package main, is what makes it testable without Postgres or a listener.
 func (s *Server) Run(ctx context.Context, j job.Job) error
+
+// deliver routes one Result frame to whoever is waiting for that attempt.
+// Unexported, but the tests call it directly — it is the seam that lets them
+// drive a result without a live agent.
+func (s *Server) deliver(r *pb.Result)
+
+// ErrAgentGone belongs in errors.go beside ErrNoAgents and ErrSlowAgent: it is
+// the third "not delivered, try later" sentinel and it gets matched with
+// errors.Is the same way. Unlike those two the job *was* delivered — the agent
+// took it and then vanished without reporting — which is worth saying in its
+// doc comment, because it is the one that means "this may have run twice".
+var ErrAgentGone = errors.New("agent disconnected before reporting")
 ```
 
 **No `Store` interface in this package.** `dispatch.runOne` already records every outcome with the correct fencing — `store.Complete(recCtx, j.ID, d.cfg.Name, …)` at `dispatch.go:162`, whose SQL requires `leased_by = $2 AND state = 'leased'` (`store.go:284`). The RPC server's job is to turn a `Result` frame into the `error` (or `nil`) that `Run` returns; storage never enters this package. That deletes the whole `leasedBy` problem the first draft tried to solve by loosening the store's `WHERE` clause — a change that would have removed dispatch's only protection against a stale worker completing a re-leased job.
 
-The handler:
+**Requirements:**
 
-```go
-func (s *Server) Assign(stream pb.Conveyor_AssignServer) error {
-  ctx, cancel := context.WithCancel(stream.Context())
-  defer cancel() // also the stop signal the registry holds for displacement/CloseAll
+* **`Assign` derives its own cancellable context from `stream.Context()`** and hands that `cancel` to `Register`. It is the stop signal the registry holds for displacement and `CloseAll`, so a cancelled agent's `Recv` returns and the handler unwinds through its own `defer`s — one exit path, not two.
+* **Two pumps under `errgroup.WithContext`,** one send, one receive, both watching the group context. A `Send` error (agent gone) must wake the receiver and a `Recv` error must wake the sender; without the shared context one of them blocks forever. `SetLimit` is pointless here — one stream is exactly two goroutines.
+* **The send pump owns the channel `Register` was given.** Select on it and on context cancellation; a failed `Send` is the agent leaving, so return it.
+* **The receive pump owns identity, capabilities, progress, and results.** `Recv` returning `io.EOF` ends the RPC (§0.4: no half-close). Dispatch by payload variant:
+  * `Register` — first one calls `Registry.Register` and *records the returned `*Agent` where the handler's deferred `Unregister` can see it*; every later one calls `SetCapabilities` on that same agent. Identity is first-Register-wins; log and ignore an `agent_id` that changes mid-stream. Getting this wrong is finding 7: a second `Register` passes this stream's own `cancel` as the displaced agent's and the agent disconnects itself.
+  * `Heartbeat` — log at debug. Liveness only; the lease is the real clock.
+  * `Progress` — `hub.Publish` a `job.Leased` event with `CreatedAt: time.Now()`.
+  * `Result` — `deliver` it.
+  * `nil` — an unknown variant from a newer agent. Log at debug and continue; phase 8's `TestUnknownVariantIsForwardCompatible` is the contract.
 
-  send := make(chan *pb.ServerToAgent, 1)
-  var agent *Agent // written by recvPump on Register, read by this defer after g.Wait
-  defer func() {
-    if agent != nil { s.registry.Unregister(agent) }
-  }()
-
-  g, gctx := errgroup.WithContext(ctx)
-  g.Go(func() error { return s.sendPump(gctx, stream, send) })
-  g.Go(func() error { return s.recvPump(gctx, stream, send, cancel, &agent) })
-  err := g.Wait()
-  if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
-    return nil // the agent went away; not a server failure worth an error code
-  }
-  return err
-}
-
-func (s *Server) sendPump(ctx context.Context, stream pb.Conveyor_AssignServer, send <-chan *pb.ServerToAgent) error {
-  for {
-    select {
-    case <-ctx.Done(): return ctx.Err()
-    case msg := <-send:
-      if err := stream.Send(msg); err != nil { return err }
-    }
-  }
-}
-
-func (s *Server) recvPump(ctx context.Context, stream pb.Conveyor_AssignServer, send chan *pb.ServerToAgent, cancel context.CancelFunc, agent **Agent) error {
-  for {
-    msg, err := stream.Recv() // wakes on ctx cancel too: gRPC closes the stream
-    if err != nil { return err } // io.EOF: client closed. Ends the RPC — see §0.4.
-    switch p := msg.GetPayload().(type) {
-    case *pb.AgentToServer_Register:
-      // Registration lives here, not before the pumps: a pre-Recv for identity
-      // makes two readers of one stream and hangs on any agent that speaks out
-      // of order.
-      if *agent == nil {
-        *agent = s.registry.Register(p.Register.GetAgentId(), p.Register.GetCapabilities(), send, cancel)
-        break
-      }
-      // Re-Register on a live stream is a capability update, never a new entry.
-      // Calling Register again would pass this stream's own cancel as the
-      // "old" agent's, killing the connection, and would close a done channel
-      // that in-flight Runs are waiting on. Identity is first-Register-wins.
-      if id := p.Register.GetAgentId(); id != (*agent).ID {
-        s.log.Warn("ignoring agent id change on a live stream", "from", (*agent).ID, "to", id)
-      }
-      s.registry.SetCapabilities(*agent, p.Register.GetCapabilities())
-    case *pb.AgentToServer_Heartbeat: // liveness only; the lease is the real clock
-      s.log.Debug("heartbeat", "agent", agentID(*agent))
-    case *pb.AgentToServer_Progress:
-      s.hub.Publish(job.Event{JobID: p.Progress.GetJobId(), State: job.Leased,
-        Message: p.Progress.GetMessage(), CreatedAt: time.Now()})
-    case *pb.AgentToServer_Result:
-      s.deliver(p.Result)
-    case nil: // unknown variant from a newer agent — see phase 8's forward-compat test
-      s.log.Debug("unknown payload", "agent", agentID(*agent))
-    }
-  }
-}
-
-// await registers the channel Run blocks on. Called before reg.Assign so a fast
-// agent's Result can never arrive before there is somewhere to put it. Keyed by
-// job AND attempt: a late Result from an abandoned attempt must not be able to
-// find this one.
-func (s *Server) await(j job.Job) <-chan error
-func (s *Server) forget(j job.Job)
-
-// deliver hands one Result to the waiting Run goroutine. Non-blocking on a
-// buffered channel: a duplicate Result (at-least-once) finds the buffer full and
-// is dropped, and a Result whose attempt nobody is waiting on — reaped, or
-// abandoned by ErrLeaseLost and already retried — finds no waiter at all.
-// Neither is an error; both are logged, and the second one is the case that
-// silently corrupted attempt 2 before the attempt token existed.
-func (s *Server) deliver(r *pb.Result) {
-  var cause error
-  if r.GetError() != "" { cause = errors.New(r.GetError()) }
-  key := attemptKey{jobID: r.GetJobId(), attempt: r.GetAttempt()}
-  s.mu.Lock()
-  ch, ok := s.waiters[key]
-  s.mu.Unlock()
-  if !ok {
-    s.log.Warn("result for an attempt nobody is waiting on", "job", key.jobID, "attempt", key.attempt)
-    return
-  }
-  select {
-  case ch <- cause:
-  default:
-    s.log.Warn("duplicate result", "job", key.jobID, "attempt", key.attempt)
-  }
-}
-
-func (s *Server) Run(ctx context.Context, j job.Job) error {
-  result := s.await(j)
-  defer s.forget(j)
-  agent, err := s.registry.Assign(j)
-  if err != nil {
-    return fmt.Errorf("assign %s: %w", j.ID, err)
-  }
-  select {
-  case cause := <-result:
-    return cause // nil means the agent reported success
-  case <-agent.Done():
-    // The agent vanished. Drain first: recvPump's deliver happens before the
-    // handler unwinds and closes Done, so a Result that raced the disconnect is
-    // already buffered and must win over a spurious retry.
-    select {
-    case cause := <-result:
-      return cause
-    default:
-      return fmt.Errorf("job %s attempt %d on agent %s: %w", j.ID, j.Attempt, agent.ID, ErrAgentGone)
-    }
-  case <-ctx.Done():
-    return ctx.Err() // lease lost or shutdown; dispatch Fails it and the policy retries
-  }
-}
-
-var ErrAgentGone = errors.New("agent disconnected before reporting")
-```
+  **The agent pointer is nil until the first `Register` lands, and three of those five branches can run before it does.** `Heartbeat`, `Progress`, and the unknown variant all arrive on a stream that has not identified itself — that is not an edge case, it is the first frame of every agent that sends anything before `Register`. So any log line naming the agent in those branches must tolerate a nil pointer; dereferencing `.ID` there panics, and because grpc-go does not recover handler panics it takes the process with it. `TestPreRegisterFramesAreSafe` is the guard.
+* **Unregister exactly once, only if registration happened.** An agent that never sent `Register` was never in the registry. Read the agent pointer after the group has returned, so the write from the receive pump is ordered before the read.
+* **`Assign` returns `nil` for a client that merely went away** — `io.EOF`, `context.Canceled`. A disconnect is not a server failure worth an error code; anything else is the transport error.
+* **The waiter map is keyed by job *and* attempt.** A `struct{ jobID string; attempt int32 }` key is enough. Registering happens before `Registry.Assign`, so a fast agent's `Result` can never arrive before there is somewhere to put it, and it is dropped after `Run` returns. Buffer one — that makes both delivery and the duplicate case non-blocking.
+* **`deliver` never blocks and never errors.** No waiter for that `(job, attempt)` means the attempt was reaped or abandoned and already retried; a full buffer means a duplicate `Result`, which at-least-once makes routine. Log both — the first one is the case that silently corrupted attempt 2 before the attempt token existed — and return.
+* **`Run` selects on three things:** its attempt's result, `Agent.Done()`, and `ctx.Done()`. On the `Done()` branch, drain the result channel non-blockingly *first*: `deliver` runs in the receive pump strictly before the handler unwinds and the registry closes `done`, so a result that raced the disconnect is already buffered and must win over a spurious retry. Failing to drain retries a finished job on every clean agent shutdown.
+* **`ErrAgentGone`** is the third-case error, wrapped with job, attempt, and agent ID. It is retryable, and the job is still leased by `cfg.Name` when dispatch `Fail`s it, so the retry lands cleanly.
+* A `Registry.Assign` failure comes back wrapped as `assign <job>: %w` so `ErrNoAgents`/`ErrSlowAgent` survive `errors.Is` for the operator reading logs.
 
 ### Decisions
 
@@ -580,6 +490,71 @@ func TestStreamReceivesAssignment(t *testing.T) {
   msg, err := stream.Recv()
   if err != nil { t.Fatal(err) }
   if msg.GetAssignment().GetJobId() != "j-1" { t.Fatalf("want j-1, got %v", msg.GetAssignment()) }
+}
+
+func TestProgressIsPublished(t *testing.T) {
+  ctx := t.Context()
+  lis := bufconn.Listen(1 << 20); t.Cleanup(func() { lis.Close() })
+  hub := newFakeHub()
+  reg := NewRegistry()
+  srv := grpc.NewServer(); pb.RegisterConveyorServer(srv, NewServer(hub, reg, slog.Default()))
+  go srv.Serve(lis); t.Cleanup(srv.Stop)
+  conn := dialBufconn(t, lis); client := pb.NewConveyorClient(conn)
+  stream, err := client.Assign(ctx)
+  if err != nil { t.Fatal(err) }
+  if err := stream.Send(&pb.AgentToServer{Payload: &pb.AgentToServer_Progress{
+    Progress: &pb.Progress{JobId: "j-1", Message: "halfway"}}}); err != nil {
+    t.Fatal(err)
+  }
+
+  // Progress needs no Register: it is telemetry, not work, so an agent that has
+  // not identified itself can still narrate. SSE readers get it through the
+  // same hub the store publishes to.
+  waitFor(t, func() bool { return len(hub.published()) == 1 })
+  ev := hub.published()[0]
+  if ev.JobID != "j-1" || ev.Message != "halfway" || ev.State != job.Leased {
+    t.Fatalf("published %+v", ev)
+  }
+  if ev.CreatedAt.IsZero() {
+    t.Fatal("stream-published events must carry a timestamp; no row supplies one")
+  }
+}
+
+func TestPreRegisterFramesAreSafe(t *testing.T) {
+  ctx := t.Context()
+  lis := bufconn.Listen(1 << 20); t.Cleanup(func() { lis.Close() })
+  reg := NewRegistry()
+  srv := grpc.NewServer(); pb.RegisterConveyorServer(srv, NewServer(newFakeHub(), reg, slog.Default()))
+  go srv.Serve(lis); t.Cleanup(srv.Stop)
+  conn := dialBufconn(t, lis); client := pb.NewConveyorClient(conn)
+  stream, err := client.Assign(ctx)
+  if err != nil { t.Fatal(err) }
+
+  // Everything an agent can say before it says who it is. A log line that
+  // dereferences the agent pointer in any of these branches panics here, and
+  // grpc-go does not recover handler panics — the test binary dies with it.
+  if err := stream.Send(&pb.AgentToServer{Payload: &pb.AgentToServer_Heartbeat{
+    Heartbeat: &pb.Heartbeat{}}}); err != nil {
+    t.Fatal(err)
+  }
+  if err := stream.Send(&pb.AgentToServer{Payload: &pb.AgentToServer_Result{
+    Result: &pb.Result{JobId: "nobody-waiting"}}}); err != nil {
+    t.Fatal(err)
+  }
+  // An unset oneof: GetPayload() is a nil interface, so this lands in the same
+  // `case nil` a future variant would. The two are indistinguishable at this
+  // seam, which is why one branch handles both — and it is the branch whose
+  // log line named the agent, so it is the likeliest nil deref of the three.
+  if err := stream.Send(&pb.AgentToServer{}); err != nil {
+    t.Fatal(err)
+  }
+
+  // The stream must still be alive and still assignable afterwards.
+  if err := stream.Send(&pb.AgentToServer{Payload: &pb.AgentToServer_Register{
+    Register: &pb.Register{AgentId: "a-1"}}}); err != nil {
+    t.Fatal(err)
+  }
+  waitFor(t, func() bool { return len(reg.List()) == 1 })
 }
 
 func TestReRegisterKeepsTheStreamAndTheJob(t *testing.T) {
@@ -750,7 +725,66 @@ func TestDisconnectUnregisters(t *testing.T) {
 }
 ```
 
-`newFakeHub` is a 10-line in-memory `Publisher`; `dialBufconn` is 8 lines (see §0.5) and must `t.Cleanup(conn.Close)`; `agentID(a *Agent) string` is a two-line log helper returning `"unregistered"` for a nil agent. No `newFakeStore` — this package has no store. Reuse `waitFor` from dispatch tests. Run with `-race -count=2`.
+### Test helpers (verbatim)
+
+The tests above are the contract, so the things they call are given too — the code budget freed by cutting the five function bodies goes here.
+
+```go
+// waitFor is a third copy of dispatch_test.go:21, not a reuse: it is a
+// package-private test helper, so package rpc cannot see it. internal/httpapi
+// already carries the second copy (event_server_test.go:22) for the same
+// reason. Twelve duplicated lines beat exporting a test helper from a package
+// that has no other reason to have an exported testing surface.
+func waitFor(t *testing.T, cond func() bool) {
+  t.Helper()
+  deadline := time.Now().Add(2 * time.Second)
+  for !cond() {
+    if time.Now().After(deadline) {
+      t.Fatal("condition never became true")
+    }
+    runtime.Gosched()
+  }
+}
+
+// fakeHub records published events. Locked because recvPump publishes from the
+// stream goroutine while the test goroutine reads.
+type fakeHub struct {
+  mu     sync.Mutex
+  events []job.Event
+}
+
+func newFakeHub() *fakeHub { return &fakeHub{} }
+
+func (h *fakeHub) Publish(ev job.Event) {
+  h.mu.Lock()
+  defer h.mu.Unlock()
+  h.events = append(h.events, ev)
+}
+
+func (h *fakeHub) published() []job.Event {
+  h.mu.Lock()
+  defer h.mu.Unlock()
+  return append([]job.Event(nil), h.events...)
+}
+
+// dialBufconn connects to an in-process server. passthrough:// keeps the
+// resolver out of it; the dialer ignores the address entirely.
+func dialBufconn(t *testing.T, lis *bufconn.Listener) *grpc.ClientConn {
+  t.Helper()
+  conn, err := grpc.NewClient("passthrough://bufnet",
+    grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+      return lis.DialContext(ctx)
+    }),
+    grpc.WithTransportCredentials(insecure.NewCredentials()))
+  if err != nil {
+    t.Fatal(err)
+  }
+  t.Cleanup(func() { conn.Close() })
+  return conn
+}
+```
+
+No `newFakeStore` — this package has no store. Run with `-race -count=2`.
 
 ---
 
