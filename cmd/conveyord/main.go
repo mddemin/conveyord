@@ -14,12 +14,16 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	pb "github.com/mddemin/conveyor/gen/conveyor/v1"
 	"github.com/mddemin/conveyor/internal/dispatch"
 	"github.com/mddemin/conveyor/internal/httpapi"
 	"github.com/mddemin/conveyor/internal/hub"
 	"github.com/mddemin/conveyor/internal/job"
+	"github.com/mddemin/conveyor/internal/rpc"
 	"github.com/mddemin/conveyor/internal/store"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 // jobStore adapts *store.Store to httpapi.Store: the API declares the filter
@@ -30,15 +34,8 @@ func (s jobStore) List(ctx context.Context, f httpapi.Filter) ([]job.Job, error)
 	return s.Store.List(ctx, store.Filter{State: f.State, Limit: f.Limit})
 }
 
-type dummyRunner struct{}
-
-// ponytail: placeholder runner, replaced by gRPC assignment in phase 9.
-func (r dummyRunner) Run(ctx context.Context, j job.Job) error {
-	time.Sleep(250 * time.Millisecond) // hold the job long enough to interrupt it mid-run
-	return nil
-}
-
 type config struct {
+	grpcAddr     string
 	addr         string
 	dsn          string
 	name         string
@@ -56,6 +53,7 @@ func parseArgs(args []string, dsnEnv string) (config, error) {
 		reapInterval = fs.Duration("reap-interval", 30*time.Second, "expired-lease reaper interval")
 		drain        = fs.Duration("drain", 15*time.Second, "graceful shutdown deadline")
 	)
+	fs.StringVar(&c.grpcAddr, "grpc-addr", ":50051", "gRPC listen address")
 	fs.StringVar(&c.addr, "addr", ":8080", "listen address")
 	fs.StringVar(&c.dsn, "dsn", "", "Postgres connection string")
 	fs.StringVar(&c.name, "name", "", "dispatcher identity in leased_by")
@@ -102,7 +100,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, os.Args[1:], log, stop, func(a net.Addr) {}); err != nil && !errors.Is(err, context.Canceled) {
+	if err := run(ctx, os.Args[1:], log, stop, func(_, _ net.Addr) {}); err != nil && !errors.Is(err, context.Canceled) {
 		log.Error("exiting", "err", err)
 		os.Exit(1)
 	}
@@ -119,11 +117,22 @@ func serve(srv *http.Server, ln net.Listener) error {
 	return err
 }
 
+// serveGRPC runs the gRPC server until it is stopped. GracefulStop makes Serve
+// return grpc.ErrServerStopped, which is a clean shutdown, not a failure — the
+// gRPC counterpart of serve's http.ErrServerClosed.
+func serveGRPC(srv *grpc.Server, ln net.Listener) error {
+	err := srv.Serve(ln)
+	if errors.Is(err, grpc.ErrServerStopped) {
+		return nil
+	}
+	return err
+}
+
 // run wires the whole daemon and blocks until shutdown completes. Ordering
 // contract: the pool is created first and closed last (deferred); everything
 // long-lived is an errgroup member cancelled by gctx; streaming handlers die
 // through baseCtx before Shutdown drains them.
-func run(ctx context.Context, args []string, log *slog.Logger, stop context.CancelFunc, onListen func(net.Addr)) error {
+func run(ctx context.Context, args []string, log *slog.Logger, stop context.CancelFunc, onListen func(httpAddr, grpcAddr net.Addr)) error {
 	dsnEnv := os.Getenv("CONVEYOR_DSN")
 
 	cfg, err := parseArgs(args, dsnEnv)
@@ -176,14 +185,36 @@ func run(ctx context.Context, args []string, log *slog.Logger, stop context.Canc
 		return fmt.Errorf("listening on %s: %w", srv.Addr, err)
 	}
 
-	onListen(ln.Addr())
-	log.Info("listening", "addr", ln.Addr().String()) // bind already succeeded
+	grpcLn, err := net.Listen("tcp", cfg.grpcAddr)
+	if err != nil {
+		ln.Close() // this listener has no owner yet: nothing will Serve it now
+		return fmt.Errorf("listening on %s: %w", cfg.grpcAddr, err)
+	}
 
-	// placeholder runner, replaced by gRPC assignment in phase 9.
-	runner := dummyRunner{}
+	// Both binds succeeded, so the daemon is reachable on both protocols: one
+	// callback, after the last thing that can fail before the group starts.
+	onListen(ln.Addr(), grpcLn.Addr())
+	log.Info("listening", "addr", ln.Addr().String(), "grpc_addr", grpcLn.Addr().String())
 
-	d := dispatch.New(st, runner, log, cfg.dispatch)
+	reg := rpc.NewRegistry()
+	rpcSrv := rpc.NewServer(events, reg, log)
+	d := dispatch.New(st, rpcSrv, log, cfg.dispatch)
 
+	grpcSrv := grpc.NewServer(grpc.KeepaliveParams(keepalive.ServerParameters{
+		Time:    30 * time.Second, // ping an idle stream
+		Timeout: 10 * time.Second, // then give up on it
+	}))
+	pb.RegisterConveyorServer(grpcSrv, rpcSrv)
+
+	g.Go(func() error { return serveGRPC(grpcSrv, grpcLn) }) // returns nil after a graceful stop
+	g.Go(func() error {
+		<-gctx.Done()
+		reg.CloseAll() // every Assign handler returns; without this GracefulStop waits forever
+		hard := time.AfterFunc(5*time.Second, grpcSrv.Stop)
+		defer hard.Stop()
+		grpcSrv.GracefulStop()
+		return gctx.Err()
+	})
 	g.Go(func() error { return serve(srv, ln) }) // returns nil on ErrServerClosed
 	g.Go(func() error { return d.Run(gctx) })
 	g.Go(func() error { return d.Reap(gctx) })

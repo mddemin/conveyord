@@ -15,12 +15,15 @@ import (
 	"testing"
 	"time"
 
+	pb "github.com/mddemin/conveyor/gen/conveyor/v1"
 	"github.com/mddemin/conveyor/internal/httpapi"
 	"github.com/mddemin/conveyor/internal/hub"
 	"github.com/mddemin/conveyor/internal/job"
 	"github.com/mddemin/conveyor/internal/pgtest"
 	"github.com/mddemin/conveyor/internal/store"
 	"go.uber.org/goleak"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func TestMain(m *testing.M) {
@@ -134,9 +137,16 @@ func TestEnqueueAndReadBackOverHTTP(t *testing.T) {
 	}
 }
 
-// The end of the phase: a job running when the signal arrives is not lost.
-// The placeholder runner holds each job ~250ms, so the cancel below lands
-// while it is genuinely mid-flight.
+// The end of the phase: a job in flight when the signal arrives is not lost.
+// In flight now means held by a connected agent — there is no placeholder
+// runner any more, so without an agent the job would bounce off ErrNoAgents
+// and never be leased for long enough to interrupt.
+//
+// The agent registers and then says nothing, which is what makes the job stay
+// leased: Server.Run blocks on a Result that never comes while the renewal
+// pump keeps the lease alive. SIGTERM cancels it, dispatch fails the job while
+// it still holds the lease, and the policy hands it back as pending — the
+// at-least-once outcome the phase specifies, not a lost job.
 func TestSIGTERMDrainsAnInFlightJob(t *testing.T) {
 	dsn := pgtest.DSN(t)
 	// Order independence: earlier tests' rows must not leak into this test's
@@ -151,15 +161,33 @@ func TestSIGTERMDrainsAnInFlightJob(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	errc := make(chan error, 1)
-	addrc := make(chan net.Addr, 1)
+	addrc := make(chan [2]net.Addr, 1)
 	// Exits when ctx is cancelled below, which is what a signal does to the
 	// context main builds.
 	go func() {
-		errc <- run(ctx, []string{"-addr", "127.0.0.1:0", "-dsn", dsn}, testLogger(t), func() {},
-			func(a net.Addr) { addrc <- a })
+		errc <- run(ctx, []string{"-addr", "127.0.0.1:0", "-dsn", dsn, "-grpc-addr", "127.0.0.1:0"}, testLogger(t), func() {},
+			func(httpAddr, grpcAddr net.Addr) { addrc <- [2]net.Addr{httpAddr, grpcAddr} })
 	}()
-	addr := <-addrc
-	base := "http://" + addr.String()
+	addrs := <-addrc
+	base := "http://" + addrs[0].String()
+
+	// A real agent over the real listener: register, then go quiet.
+	conn, err := grpc.NewClient(addrs[1].String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dialling gRPC: %v", err)
+	}
+	defer conn.Close()
+	streamCtx, endStream := context.WithCancel(t.Context())
+	defer endStream()
+	stream, err := pb.NewConveyorClient(conn).Assign(streamCtx)
+	if err != nil {
+		t.Fatalf("opening the agent stream: %v", err)
+	}
+	if err := stream.Send(&pb.AgentToServer{Payload: &pb.AgentToServer_Register{
+		Register: &pb.Register{AgentId: "drain-test"}, // no capabilities: takes any type
+	}}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
 
 	resp, err := http.Post(base+"/jobs", "application/json", strings.NewReader(`{"type":"slow"}`))
 	if err != nil {
@@ -174,24 +202,14 @@ func TestSIGTERMDrainsAnInFlightJob(t *testing.T) {
 		t.Fatalf("POST /jobs returned %d, want 201", resp.StatusCode)
 	}
 
-	// Bounded poll until leased: proves the dispatcher took the job while we
-	// were watching. The authoritative endpoint decides; the SSE stream is a
-	// debugging tool, not an assertion mechanism.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		r, err := http.Get(base + "/jobs/" + created.ID)
-		if err == nil {
-			var j jobResponse
-			if json.NewDecoder(r.Body).Decode(&j) == nil && j.State == "leased" {
-				r.Body.Close()
-				break
-			}
-			r.Body.Close()
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the job never reached leased — dispatcher not draining the queue?")
-		}
-		time.Sleep(2 * time.Millisecond)
+	// The assignment arriving is the synchronisation point: the agent now holds
+	// the job, so the dispatcher is genuinely blocked in Run.
+	assigned, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("waiting for the assignment: %v", err)
+	}
+	if got := assigned.GetAssignment().GetJobId(); got != created.ID {
+		t.Fatalf("assigned %q, want %q", got, created.ID)
 	}
 
 	cancel() // the simulated SIGTERM
@@ -205,14 +223,15 @@ func TestSIGTERMDrainsAnInFlightJob(t *testing.T) {
 		t.Fatal("run did not return within the drain window")
 	}
 
-	// The payoff: the server is gone, so the verdict comes from Postgres —
-	// the job was drained and recorded, not abandoned at its lease.
+	// The payoff: the server is gone, so the verdict comes from Postgres. The
+	// job was recorded and rescheduled, not abandoned at its lease waiting for
+	// the reaper.
 	st := store.New(pgtest.Pool(t), hub.New())
 	got, err := st.Get(context.Background(), created.ID)
 	if err != nil {
 		t.Fatalf("reading the job back after shutdown: %v", err)
 	}
-	if got.State != job.Succeeded {
-		t.Errorf("after SIGTERM the job is %s, want succeeded (drained, not abandoned)", got.State)
+	if got.State != job.Pending || got.Attempt != 1 {
+		t.Errorf("after SIGTERM the job is %s attempt %d, want pending attempt 1 (retried, not abandoned)", got.State, got.Attempt)
 	}
 }
