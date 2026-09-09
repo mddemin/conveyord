@@ -3,6 +3,7 @@ package rpc
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/mddemin/conveyor/internal/job"
@@ -31,6 +32,35 @@ func TestRegistryIsConcurrentSafe(t *testing.T) {
 	// paired with an Unregister, so a leaked entry is a lost cancel func.
 	if n := len(r.List()); n != 0 {
 		t.Fatalf("registry not drained: %d agents left", n)
+	}
+}
+
+// Capabilities is the operator endpoint's only window into the registry, and
+// it hands out a copy for the same reason capabilities is unexported: List
+// gives callers live *Agent pointers, and SetCapabilities rewrites the map
+// under them on the next Register frame.
+func TestCapabilitiesAreASortedCopy(t *testing.T) {
+	r := NewRegistry()
+	a := r.Register("a-1", []string{"sleep", "checksum"}, make(chan *pb.ServerToAgent, 1), func() {})
+
+	got := r.Capabilities(a)
+	if want := []string{"checksum", "sleep"}; !slices.Equal(got, want) {
+		t.Fatalf("Capabilities = %v, want %v sorted", got, want)
+	}
+
+	// Mutating the result must not reach the registry, and a capability update
+	// must not reach an already-returned slice.
+	got[0] = "clobbered"
+	r.SetCapabilities(a, []string{"resize"})
+	if now := r.Capabilities(a); !slices.Equal(now, []string{"resize"}) {
+		t.Errorf("Capabilities = %v after an update, want [resize]", now)
+	}
+
+	// An agent that announced nothing takes any type, and says so as an empty
+	// list rather than as null on the wire.
+	anyType := r.Register("a-2", nil, make(chan *pb.ServerToAgent, 1), func() {})
+	if caps := r.Capabilities(anyType); len(caps) != 0 || caps == nil {
+		t.Errorf("Capabilities = %#v, want an empty non-nil slice", caps)
 	}
 }
 

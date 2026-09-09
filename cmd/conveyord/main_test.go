@@ -20,6 +20,7 @@ import (
 	"github.com/mddemin/conveyor/internal/hub"
 	"github.com/mddemin/conveyor/internal/job"
 	"github.com/mddemin/conveyor/internal/pgtest"
+	"github.com/mddemin/conveyor/internal/rpc"
 	"github.com/mddemin/conveyor/internal/store"
 	"go.uber.org/goleak"
 	"google.golang.org/grpc"
@@ -69,9 +70,47 @@ type jobResponse struct {
 	Payload json.RawMessage `json:"payload"`
 }
 
+// agentResponse is the /agents wire form, declared here for the same reason
+// jobResponse is: a test that reuses the server's struct agrees with it by
+// construction, including when both are wrong.
+type agentResponse struct {
+	ID           string   `json:"id"`
+	Capabilities []string `json:"capabilities"`
+}
+
+func fetchAgents(t *testing.T, base string) []agentResponse {
+	t.Helper()
+	resp, err := http.Get(base + "/agents")
+	if err != nil {
+		t.Fatalf("GET /agents: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /agents returned %d, want 200", resp.StatusCode)
+	}
+	var agents []agentResponse
+	if err := json.NewDecoder(resp.Body).Decode(&agents); err != nil {
+		t.Fatalf("decoding /agents: %v", err)
+	}
+	return agents
+}
+
+// waitFor polls because registration is asynchronous: the client's Send
+// returns before the server's receive pump has run.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition never became true")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestEnqueueAndReadBackOverHTTP(t *testing.T) {
 	s := freshDB(t, hub.New()) // the real *store.Store
-	api := httpapi.New(jobStore{s}, hub.New(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	api := httpapi.New(jobStore{s}, agentRegistry{rpc.NewRegistry()}, hub.New(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	ts := httptest.NewServer(api)
 	t.Cleanup(ts.Close)
 
@@ -187,6 +226,15 @@ func TestSIGTERMDrainsAnInFlightJob(t *testing.T) {
 		Register: &pb.Register{AgentId: "drain-test"}, // no capabilities: takes any type
 	}}); err != nil {
 		t.Fatalf("Register: %v", err)
+	}
+
+	// GET /agents is the operator's answer to "is my agent connected?", and
+	// the only thing that can be wrong here is the wiring in run: the adapter,
+	// the route, and the registry the gRPC server actually writes to. Poll,
+	// because Register returns before the server handler has processed it.
+	waitFor(t, func() bool { return len(fetchAgents(t, base)) == 1 })
+	if got := fetchAgents(t, base)[0].ID; got != "drain-test" {
+		t.Errorf("GET /agents reported %q, want the agent that just registered", got)
 	}
 
 	resp, err := http.Post(base+"/jobs", "application/json", strings.NewReader(`{"type":"slow"}`))

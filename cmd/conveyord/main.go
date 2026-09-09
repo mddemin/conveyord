@@ -34,6 +34,20 @@ func (s jobStore) List(ctx context.Context, f httpapi.Filter) ([]job.Job, error)
 	return s.Store.List(ctx, store.Filter{State: f.State, Limit: f.Limit})
 }
 
+// agentRegistry adapts *rpc.Registry to httpapi.Agents, the same way jobStore
+// adapts the store: the API declares the shape it serves, the registry keeps
+// its own, and main is where they meet.
+type agentRegistry struct{ *rpc.Registry }
+
+func (r agentRegistry) Agents() []httpapi.AgentInfo {
+	agents := r.List()
+	out := make([]httpapi.AgentInfo, 0, len(agents))
+	for _, a := range agents {
+		out = append(out, httpapi.AgentInfo{ID: a.ID, Capabilities: r.Capabilities(a)})
+	}
+	return out
+}
+
 type config struct {
 	grpcAddr     string
 	addr         string
@@ -53,7 +67,11 @@ func parseArgs(args []string, dsnEnv string) (config, error) {
 		reapInterval = fs.Duration("reap-interval", 30*time.Second, "expired-lease reaper interval")
 		drain        = fs.Duration("drain", 15*time.Second, "graceful shutdown deadline")
 	)
-	fs.StringVar(&c.grpcAddr, "grpc-addr", ":50051", "gRPC listen address")
+	// Loopback by default, because the gRPC listener has no authentication:
+	// anything that can reach it registers, claims any capability, and is
+	// handed jobs. That is a trust boundary, and the safe end of it is the
+	// default. Exposing it off-host is an explicit act — see exposedWarning.
+	fs.StringVar(&c.grpcAddr, "grpc-addr", "127.0.0.1:50051", "gRPC listen address; unauthenticated, so off-host exposure needs a network boundary you trust")
 	fs.StringVar(&c.addr, "addr", ":8080", "listen address")
 	fs.StringVar(&c.dsn, "dsn", "", "Postgres connection string")
 	fs.StringVar(&c.name, "name", "", "dispatcher identity in leased_by")
@@ -128,6 +146,29 @@ func serveGRPC(srv *grpc.Server, ln net.Listener) error {
 	return err
 }
 
+// exposedWarning reports why a gRPC bind is a risk, or "" when it is not. The
+// listener authenticates nobody: any process that reaches it registers under
+// any name, claims any capability, and is handed real jobs with real
+// payloads. Phase 10 does not ship mTLS, so the honest position is a
+// loopback default plus a line in the log that says exactly what a wider bind
+// means — silence would be the wrong answer.
+func exposedWarning(addr net.Addr) string {
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return "" // not a TCP address: nothing to judge
+	}
+	ip := net.ParseIP(host)
+	switch {
+	case ip == nil:
+		return ""
+	case ip.IsUnspecified():
+		return "bound to every interface with no authentication: anything that can route to this host can register as an agent and take jobs"
+	case !ip.IsLoopback():
+		return "bound off-loopback with no authentication: only expose this inside a network boundary you trust"
+	}
+	return ""
+}
+
 // run wires the whole daemon and blocks until shutdown completes. Ordering
 // contract: the pool is created first and closed last (deferred); everything
 // long-lived is an errgroup member cancelled by gctx; streaming handlers die
@@ -165,7 +206,9 @@ func run(ctx context.Context, args []string, log *slog.Logger, stop context.Canc
 
 	st := jobStore{store.New(pool, events)}
 
-	api := httpapi.New(st, events, log)
+	reg := rpc.NewRegistry()
+
+	api := httpapi.New(st, agentRegistry{reg}, events, log)
 
 	g, gctx := errgroup.WithContext(ctx)
 	baseCtx, cancelBase := context.WithCancel(gctx)
@@ -195,22 +238,44 @@ func run(ctx context.Context, args []string, log *slog.Logger, stop context.Canc
 	// callback, after the last thing that can fail before the group starts.
 	onListen(ln.Addr(), grpcLn.Addr())
 	log.Info("listening", "addr", ln.Addr().String(), "grpc_addr", grpcLn.Addr().String())
+	if why := exposedWarning(grpcLn.Addr()); why != "" {
+		log.Warn("grpc listener is unauthenticated", "grpc_addr", grpcLn.Addr().String(), "risk", why)
+	}
 
-	reg := rpc.NewRegistry()
 	rpcSrv := rpc.NewServer(events, reg, log)
 	d := dispatch.New(st, rpcSrv, log, cfg.dispatch)
 
-	grpcSrv := grpc.NewServer(grpc.KeepaliveParams(keepalive.ServerParameters{
-		Time:    30 * time.Second, // ping an idle stream
-		Timeout: 10 * time.Second, // then give up on it
-	}))
+	grpcSrv := grpc.NewServer(
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    30 * time.Second, // ping an idle stream
+			Timeout: 10 * time.Second, // then give up on it
+		}),
+		// Agents prove liveness with application Heartbeat frames, not with
+		// transport pings, so nothing conveyor ships trips the default
+		// five-minute minimum. This is for everyone else: the proto is the
+		// public contract, and a third-party agent that sets grpc keepalive
+		// at a sane interval would otherwise be GOAWAYed for "too_many_pings".
+		//
+		// PermitWithoutStream because the moment a client most wants to ping is
+		// while it has no stream: holding the connection warm across a
+		// reconnect. Refusing those is refusing exactly the useful case.
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             5 * time.Second,
+			PermitWithoutStream: true,
+		}),
+	)
 	pb.RegisterConveyorServer(grpcSrv, rpcSrv)
 
 	g.Go(func() error { return serveGRPC(grpcSrv, grpcLn) }) // returns nil after a graceful stop
 	g.Go(func() error {
 		<-gctx.Done()
 		reg.CloseAll() // every Assign handler returns; without this GracefulStop waits forever
-		hard := time.AfterFunc(5*time.Second, grpcSrv.Stop)
+		// One flag for shutdown, not two. The ladder is deliberate: CloseAll
+		// ends the streams, GracefulStop drains what is left, and the hard
+		// Stop is the backstop for a handler that ignores both — so it must
+		// outlast neither the drain budget nor the operator's expectation of
+		// how long a restart takes.
+		hard := time.AfterFunc(cfg.drainTimeout, grpcSrv.Stop)
 		defer hard.Stop()
 		grpcSrv.GracefulStop()
 		return gctx.Err()

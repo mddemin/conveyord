@@ -18,6 +18,12 @@ import (
 	"go.uber.org/goleak"
 )
 
+// stubAgents is a fixed fleet. Most tests do not care, but the route must
+// exist for the ones that do — a nil registry leaves it unrouted.
+type stubAgents []AgentInfo
+
+func (s stubAgents) Agents() []AgentInfo { return s }
+
 func newTestAPI(t *testing.T, store Store) *API {
 	t.Helper()
 	return newTestAPIWithHub(t, store, hub.New())
@@ -29,7 +35,7 @@ func newTestAPI(t *testing.T, store Store) *API {
 // runs guards nothing.
 func newTestAPIWithHub(t *testing.T, store Store, h *hub.Hub) *API {
 	t.Helper()
-	a := New(store, h, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	a := New(store, stubAgents(nil), h, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	a.heartbeat = time.Millisecond
 	return a
 }
@@ -40,7 +46,7 @@ func newTestAPIWithHub(t *testing.T, store Store, h *hub.Hub) *API {
 func newTestAPIWithLogger(t *testing.T, store Store) (*API, *bytes.Buffer) {
 	t.Helper()
 	var buf bytes.Buffer
-	return New(store, hub.New(), slog.New(slog.NewJSONHandler(&buf, nil))), &buf
+	return New(store, stubAgents(nil), hub.New(), slog.New(slog.NewJSONHandler(&buf, nil))), &buf
 }
 
 // A nil logger must not turn the first 500 into a panic — slog methods on a
@@ -48,7 +54,7 @@ func newTestAPIWithLogger(t *testing.T, store Store) (*API, *bytes.Buffer) {
 // mistake that would otherwise surface under load rather than at startup.
 // There is nothing to assert: the test is that this returns.
 func TestNewDefaultsTheLogger(t *testing.T) {
-	New(nil, nil, nil).writeError(httptest.NewRecorder(),
+	New(nil, nil, nil, nil).writeError(httptest.NewRecorder(),
 		httptest.NewRequest("GET", "/", nil), errors.New("boom"))
 }
 

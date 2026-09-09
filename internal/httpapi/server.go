@@ -59,12 +59,28 @@ type Store interface {
 	List(ctx context.Context, f Filter) ([]job.Job, error)
 }
 
+// AgentInfo is one connected agent as an operator sees it. Unlike jobResponse
+// there is no second wire struct: this type is declared by the API, so its
+// field names already are the contract.
+type AgentInfo struct {
+	ID           string   `json:"id"`
+	Capabilities []string `json:"capabilities"` // empty means the agent takes any type
+}
+
+// Agents is the slice of the agent registry this package needs. It answers
+// "is my agent connected, and what does it claim it can run?" — which was
+// otherwise only visible by reading the daemon's log.
+type Agents interface {
+	Agents() []AgentInfo
+}
+
 const requestTimeout = time.Minute
 
 // API serves the job API. It is an http.Handler; binding it to a port is
 // the caller's job.
 type API struct {
 	store     Store
+	agents    Agents
 	hub       *hub.Hub
 	log       *slog.Logger
 	handler   http.Handler
@@ -72,20 +88,27 @@ type API struct {
 }
 
 // New returns an API backed by store, streaming the events published to
-// events. Both optional arguments degrade rather than fail: a nil log becomes
+// events. The optional arguments degrade rather than fail: a nil log becomes
 // slog.Default() instead of panicking on the first 500, and a nil hub becomes
 // an empty one, so a caller that forgets to wire it gets streams that connect
 // and stay quiet instead of a nil dereference halfway through a response.
 // Neither is a supported way to call this — they are wiring mistakes that
 // should be visible in a log, not in a stack trace under load.
-func New(store Store, events *hub.Hub, log *slog.Logger) *API {
+//
+// A nil agents leaves GET /agents unrouted, so an unwired daemon 404s instead
+// of reporting an empty fleet — "no agents connected" is a fact an operator
+// acts on, and inventing it is worse than admitting the endpoint is absent.
+func New(store Store, agents Agents, events *hub.Hub, log *slog.Logger) *API {
 	if log == nil {
 		log = slog.Default()
 	}
 	if events == nil {
 		events = hub.New() // a stream that delivers nothing beats a nil-pointer panic mid-response
 	}
-	a := &API{store: store, log: log, hub: events, heartbeat: heartbeatDuration}
+	if agents == nil {
+		log.Warn("no agent registry wired: GET /agents is not served")
+	}
+	a := &API{store: store, agents: agents, log: log, hub: events, heartbeat: heartbeatDuration}
 	// Invert logging and recover and every 500 disappears from the access log
 	// invert logging and request id and request id disappears from logs
 	a.handler = chain(a.routes(), a.withRequestID, a.withLogging, a.withRecover)
@@ -108,6 +131,9 @@ func (a *API) routes() http.Handler {
 	mux.Handle("POST /jobs", timed(a.enqueue))
 	mux.Handle("GET /jobs/{id}", timed(a.get))
 	mux.Handle("GET /jobs", timed(a.list))
+	if a.agents != nil {
+		mux.Handle("GET /agents", timed(a.listAgents))
+	}
 
 	// HandleFunc, not Handle(timed(...)): the streams must not be wrapped in a
 	// timeout. The difference from the three lines above is deliberate and is

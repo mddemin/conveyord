@@ -15,6 +15,7 @@ import (
 	"github.com/mddemin/conveyor/internal/httpapi"
 	"github.com/mddemin/conveyor/internal/hub"
 	"github.com/mddemin/conveyor/internal/job"
+	"github.com/mddemin/conveyor/internal/rpc"
 	"github.com/mddemin/conveyor/internal/store"
 )
 
@@ -25,7 +26,7 @@ func liveServer(t *testing.T) (*store.Store, *httptest.Server) {
 	t.Helper()
 	h := hub.New()
 	s := freshDB(t, h)
-	ts := httptest.NewServer(httpapi.New(jobStore{s}, h, slog.New(slog.NewJSONHandler(io.Discard, nil))))
+	ts := httptest.NewServer(httpapi.New(jobStore{s}, agentRegistry{rpc.NewRegistry()}, h, slog.New(slog.NewJSONHandler(io.Discard, nil))))
 	t.Cleanup(ts.Close)
 	return s, ts
 }

@@ -11,7 +11,7 @@ proto-breaking: ## fail if the schema broke wire compatibility vs main
 
 vet: ## go vet, staticcheck, and a gofmt diff check (generated code exempt)
 	go vet ./...
-	go run honnef.co/go/tools/cmd/staticcheck@latest -checks=all $$(go list ./... | grep -v '/gen/')
+	go run honnef.co/go/tools/cmd/staticcheck@v0.7.0-0.dev.0.20260824195211-6cb65e58a558 -checks=all $$(go list ./... | grep -v '/gen/')
 	@test -z "$$(gofmt -l . | grep -v '^gen/')" || (echo "gofmt needed:" && gofmt -l . && exit 1)
 
 test: ## run the full suite with the race detector

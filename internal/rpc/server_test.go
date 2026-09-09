@@ -424,16 +424,24 @@ func TestCancelIsDroppedRatherThanBlocking(t *testing.T) {
 	}
 }
 
-// A closed agent's stream has no reader left, so the frame goes nowhere and
-// the caller is told, rather than the frame sitting in a buffer forever.
-func TestCancelReportsAClosedAgent(t *testing.T) {
+// The two ways a cancel fails are different events, and the daemon logs them
+// at different levels: a closed stream is routine shutdown, a full buffer is a
+// live agent that will keep working on an abandoned attempt.
+func TestCancelDistinguishesGoneFromBehind(t *testing.T) {
 	reg := NewRegistry()
-	send := make(chan *pb.ServerToAgent, 1)
-	a := reg.Register("a-1", nil, send, func() {})
-	reg.Unregister(a)
 
-	if reg.Cancel(a, "j-1") {
-		t.Error("Cancel claimed delivery to an agent that is gone")
+	behind := make(chan *pb.ServerToAgent, 1)
+	slow := reg.Register("a-slow", nil, behind, func() {})
+	behind <- &pb.ServerToAgent{} // its one slot is still full
+	if err := reg.Cancel(slow, "j-1"); !errors.Is(err, ErrSlowAgent) {
+		t.Errorf("Cancel on a full buffer returned %v, want ErrSlowAgent", err)
+	}
+
+	send := make(chan *pb.ServerToAgent, 1)
+	gone := reg.Register("a-gone", nil, send, func() {})
+	reg.Unregister(gone)
+	if err := reg.Cancel(gone, "j-1"); !errors.Is(err, ErrAgentGone) {
+		t.Errorf("Cancel on a closed stream returned %v, want ErrAgentGone", err)
 	}
 	if len(send) != 0 {
 		t.Error("a frame was queued on a closed agent's stream")

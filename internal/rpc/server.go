@@ -248,8 +248,16 @@ func (s *Server) Run(ctx context.Context, j job.Job) error {
 		//
 		// The attempt key is what keeps the abandoned attempt's late result
 		// off the retry's waiter; this only stops the work.
-		if !s.registry.Cancel(agent, j.ID) {
-			s.log.Warn("cancel not delivered", "job", j.ID, "attempt", j.Attempt, "agent", agent.ID)
+		switch err := s.registry.Cancel(agent, j.ID); {
+		case err == nil:
+		case errors.Is(err, ErrAgentGone):
+			// Shutdown closes every stream before this runs, and the teardown
+			// cancels the agent's jobs anyway. Routine, not a problem.
+			s.log.Debug("cancel not sent, stream already ending", "job", j.ID, "attempt", j.Attempt, "agent", agent.ID)
+		default:
+			// A live agent that is behind. It keeps working on an attempt
+			// nobody is waiting for until its own timeout.
+			s.log.Warn("cancel dropped", "job", j.ID, "attempt", j.Attempt, "agent", agent.ID, "err", err)
 		}
 		return ctx.Err()
 	}

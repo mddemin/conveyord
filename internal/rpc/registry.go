@@ -12,6 +12,7 @@ package rpc
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 
 	pb "github.com/mddemin/conveyor/gen/conveyor/v1"
@@ -120,6 +121,23 @@ func (r *Registry) List() []*Agent {
 	return list
 }
 
+// Capabilities returns the types a announced, sorted, as a copy. The map
+// itself stays unexported and behind mu because List hands out live *Agent
+// pointers and SetCapabilities mutates in place: a caller ranging over the
+// real map would race the next Register frame.
+//
+// An empty result means "any type", the same as at Register.
+func (r *Registry) Capabilities(a *Agent) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	caps := make([]string, 0, len(a.capabilities))
+	for c := range a.capabilities {
+		caps = append(caps, c)
+	}
+	slices.Sort(caps) // map order is random; an operator endpoint that reshuffles is noise
+	return caps
+}
+
 // Assign hands j to one connected agent and returns the agent that took it,
 // so the caller can wait on that stream in particular rather than on "some
 // agent". It never blocks: each agent buffers a single frame, and one that
@@ -159,25 +177,31 @@ func (r *Registry) Assign(j job.Job) (*Agent, error) {
 	return nil, fmt.Errorf("%w: can't take job's type %q", ErrNoAgents, j.Type)
 }
 
-// Cancel asks a to stop running jobID, and reports whether the frame was
-// queued. Best effort by design: the send buffer holds one frame, and an agent
-// that has not drained its last one is already behind, so the caller logs and
-// moves on rather than blocking a dispatcher on a slow stream. The lease
-// expiring is the real deadline, as the proto says.
+// Cancel asks a to stop running jobID. Best effort by design: the send buffer
+// holds one frame, and an agent that has not drained its last one is already
+// behind, so the caller logs and moves on rather than blocking a dispatcher on
+// a slow stream. The lease expiring is the real deadline, as the proto says.
+//
+// The two ways it can fail are not the same event, which is why they are two
+// sentinels rather than a bool. ErrAgentGone means the stream is already
+// ending — shutdown, displacement — and its teardown cancels every job the
+// agent is running, so nothing is lost and nobody needs telling. ErrSlowAgent
+// means a live agent will keep working on an attempt nobody is waiting for
+// until its own timeout, which is worth an operator's attention.
 //
 // It lives here rather than on Agent because send and closed are registry-
 // guarded state, and this type is their only synchronization authority.
-func (r *Registry) Cancel(a *Agent, jobID string) bool {
+func (r *Registry) Cancel(a *Agent, jobID string) error {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if a.closed {
-		return false // the stream is already ending; nothing will read this
+		return fmt.Errorf("%w: cancel for job %s not sent", ErrAgentGone, jobID)
 	}
 	select {
 	case a.send <- &pb.ServerToAgent{Payload: &pb.ServerToAgent_CancelJob{CancelJob: &pb.CancelJob{JobId: jobID}}}:
-		return true
+		return nil
 	default:
-		return false
+		return fmt.Errorf("%w: cancel for job %s dropped", ErrSlowAgent, jobID)
 	}
 }
 
