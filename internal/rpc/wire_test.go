@@ -72,6 +72,14 @@ func fixtures() []struct {
 			},
 		},
 		{
+			name: "agent_to_server_result_permanent",
+			msg: &pb.AgentToServer{
+				Payload: &pb.AgentToServer_Result{
+					Result: &pb.Result{JobId: "j-6", Error: "malformed payload", Attempt: 0, Permanent: true},
+				},
+			},
+		},
+		{
 			name: "agent_to_server_register",
 			msg: &pb.AgentToServer{
 				Payload: &pb.AgentToServer_Register{

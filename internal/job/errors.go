@@ -13,3 +13,5 @@ var ErrDuplicate = errors.New("duplicate")
 
 // ErrEmptyCause reports that cause is empty
 var ErrEmptyCause = errors.New("cause is nil")
+
+var ErrUndelivered = errors.New("job was not delivered to any executor")

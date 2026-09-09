@@ -48,6 +48,7 @@ message Result {
   string job_id = 1;
   string error = 2; // empty means success
   int32 attempt = 3; // copied from the Assignment being reported
+  bool permanent = 4; // do not retry: the payload, not the run, is the problem
 }
 
 // One long-lived stream per agent.

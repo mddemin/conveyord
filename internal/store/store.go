@@ -433,3 +433,51 @@ func (s *Store) Fail(ctx context.Context, id, leasedBy string, cause error, p jo
 	s.events.Publish(ev)
 	return d, nil
 }
+
+// next_attempt_at is deliberately not written here, which leaves a released
+// job leasable on the very next poll. A now() + Interval delay was the
+// alternative and buys nothing: the job would become eligible exactly when
+// that poll fires anyway. The real fix — skip leasing entirely while no agent
+// is connected — is not available to the dispatcher, which cannot see the
+// registry and must not import internal/rpc.
+//
+// ponytail: an agentless queue therefore costs MaxInFlight lease+release pairs
+// per poll interval (32 writes/s at the defaults). Move the skip into
+// runTurn behind a "has capacity" callback if that ever shows up in
+// pg_stat_statements.
+const releaseJobSQL = `
+      WITH released AS (
+          UPDATE jobs
+          SET state = 'pending', leased_by = NULL, lease_expires_at = NULL, updated_at = now()
+          WHERE id = $1 AND leased_by = $2 AND state = 'leased'
+          RETURNING id, state, updated_at
+      ), logged AS (
+          INSERT INTO job_events (job_id, state, message) SELECT id, state, $3 FROM released
+      )
+      SELECT * FROM released`
+
+// Release returns a leased job to pending without touching its retry budget:
+// the work was never delivered to an executor, so nothing was attempted and
+// there is nothing to back off from. attempt and next_attempt_at are left
+// exactly as they were, which is the whole difference from Fail.
+//
+// message says why, because the store cannot know: "no agents available" asks
+// the operator to deploy an agent, "agent is slow" to add one. It is recorded
+// as the job's event, the only durable copy — the dispatcher logs releases at
+// debug.
+//
+// Same fencing as every other write: a dispatcher that has lost the lease gets
+// job.ErrNotFound rather than clearing the lease of whoever now holds it.
+func (s *Store) Release(ctx context.Context, id, leasedBy, message string) error {
+	ev := job.Event{Message: message}
+	err := s.pool.QueryRow(ctx, releaseJobSQL, id, leasedBy, message).
+		Scan(&ev.JobID, &ev.State, &ev.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("%w: %s", job.ErrNotFound, id)
+	}
+	if err != nil {
+		return fmt.Errorf("releasing job %s leased by %s: %w", id, leasedBy, err)
+	}
+	s.events.Publish(ev)
+	return nil
+}

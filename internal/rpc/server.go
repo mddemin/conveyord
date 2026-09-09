@@ -217,7 +217,12 @@ func (s *Server) Run(ctx context.Context, j job.Job) error {
 
 	agent, err := s.registry.Assign(j)
 	if err != nil {
-		return fmt.Errorf("assign %s: %w", j.ID, err)
+		// Two verbs, two chains: the operator-facing reason (ErrNoAgents or
+		// ErrSlowAgent, which say whether to deploy an agent or add one) and
+		// the fact dispatch acts on — nothing took this frame, so the attempt
+		// was not spent. ErrAgentGone never comes through here: that agent had
+		// the job.
+		return fmt.Errorf("assign %s: %w: %w", j.ID, job.ErrUndelivered, err)
 	}
 
 	select {
@@ -267,6 +272,10 @@ func (s *Server) deliver(r *pb.Result) {
 	var err error
 	if r.Error != "" {
 		err = errors.New(r.Error)
+
+		if r.Permanent {
+			err = job.Permanent(err)
+		}
 	}
 	select {
 	case w <- err:

@@ -266,6 +266,47 @@ func TestRunBlocksUntilResult(t *testing.T) {
 	}
 }
 
+// Result.permanent is the agent's only way to say "the payload is wrong, not
+// the run" — without it Policy.OnFailure retries a malformed job until
+// MaxAttempts. The error Run returns is the only thing dispatch sees, so the
+// flag has to survive the trip as something job.IsPermanent recognises.
+func TestPermanentResultSurvivesTheWire(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		errText   string
+		permanent bool
+		want      bool // job.IsPermanent of the error Run returns
+	}{
+		{name: "permanent", errText: "malformed payload", permanent: true, want: true},
+		{name: "retryable", errText: "malformed payload", permanent: false, want: false},
+		// Success is never permanent. Wrapping before the empty-error check
+		// would hand dispatch a permanent failure for a job that worked.
+		{name: "success with the flag set", errText: "", permanent: true, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewServer(newFakeHub(), NewRegistry(), slog.Default())
+			send := make(chan *pb.ServerToAgent, 1)
+			s.registry.Register("a-1", nil, send, func() {})
+
+			errc := make(chan error, 1)
+			go func() { errc <- s.Run(t.Context(), job.Job{ID: "j-1", Type: "x"}) }()
+			<-send
+
+			s.deliver(&pb.Result{JobId: "j-1", Error: tc.errText, Permanent: tc.permanent})
+			err := <-errc
+			switch {
+			case tc.errText == "" && err != nil:
+				t.Fatalf("empty error is success, got %v", err)
+			case tc.errText != "" && (err == nil || err.Error() != tc.errText):
+				t.Fatalf("want the agent's error verbatim, got %v", err)
+			}
+			if got := job.IsPermanent(err); got != tc.want {
+				t.Fatalf("IsPermanent = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestStaleResultFromAbandonedAttemptIsIgnored(t *testing.T) {
 	s := NewServer(newFakeHub(), NewRegistry(), slog.Default())
 	send := make(chan *pb.ServerToAgent, 1)
@@ -336,6 +377,68 @@ func TestRunReturnsWhenAgentDisconnects(t *testing.T) {
 	s.registry.Unregister(a)
 	if err := <-errc; !errors.Is(err, ErrAgentGone) {
 		t.Fatalf("want ErrAgentGone, got %v", err)
+	}
+}
+
+// Dispatch cannot import this package, so the only thing it can read is the
+// error chain. ErrNoAgents and ErrSlowAgent mean the assignment never reached
+// an executor: nothing ran, nothing failed, and the attempt must not be spent.
+// job.ErrUndelivered is the shared vocabulary that says so.
+func TestUndeliveredAssignmentsSaySo(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(s *Server)
+		want  error
+	}{
+		{
+			name:  "nothing connected runs this type",
+			setup: func(*Server) {},
+			want:  ErrNoAgents,
+		},
+		{
+			name: "every capable agent is still holding its last frame",
+			setup: func(s *Server) {
+				send := make(chan *pb.ServerToAgent, 1)
+				s.registry.Register("a-1", nil, send, func() {})
+				send <- &pb.ServerToAgent{} // one slot, undrained: Assign passes it over
+			},
+			want: ErrSlowAgent,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewServer(newFakeHub(), NewRegistry(), slog.Default())
+			tc.setup(s)
+
+			err := s.Run(t.Context(), job.Job{ID: "j-1", Type: "x"})
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("Run returned %v, want %v", err, tc.want)
+			}
+			if !errors.Is(err, job.ErrUndelivered) {
+				t.Fatalf("Run returned %v: dispatch cannot tell it from a real failure, so it spends an attempt", err)
+			}
+		})
+	}
+}
+
+// ErrAgentGone is deliberately not undelivered: the agent had the frame and
+// may have run the job, so the attempt is spent and the policy decides. Wrap
+// this one too and a job that kills its executor retries forever.
+func TestAgentGoneIsDeliveredWork(t *testing.T) {
+	s := NewServer(newFakeHub(), NewRegistry(), slog.Default())
+	send := make(chan *pb.ServerToAgent, 1)
+	a := s.registry.Register("a-1", nil, send, func() {})
+
+	errc := make(chan error, 1)
+	go func() { errc <- s.Run(t.Context(), job.Job{ID: "j-1", Type: "x"}) }()
+	<-send
+	s.registry.Unregister(a)
+
+	err := <-errc
+	if !errors.Is(err, ErrAgentGone) {
+		t.Fatalf("want ErrAgentGone, got %v", err)
+	}
+	if errors.Is(err, job.ErrUndelivered) {
+		t.Fatalf("the agent took the job; %v must still cost an attempt", err)
 	}
 }
 

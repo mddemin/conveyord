@@ -35,15 +35,29 @@ func waitFor(t *testing.T, cond func() bool) {
 type fakeStore struct {
 	mu sync.Mutex
 
-	lease     func(n int) ([]job.Job, error) // nil means "no work"
-	renew     func(id string) error          // nil means "renewal succeeds"
-	leases    int
-	renewed   []string
-	complete  []string
-	failed    []string
-	lastCause error               // cause passed to the most recent Fail call
-	reap      func() (int, error) // nil means "nothing expired"
-	reaps     int
+	lease      func(n int) ([]job.Job, error) // nil means "no work"
+	renew      func(id string) error          // nil means "renewal succeeds"
+	leases     int
+	renewed    []string
+	complete   []string
+	failed     []string
+	released   []string
+	releaseWhy string              // message passed to the most recent Release call
+	lastCause  error               // cause passed to the most recent Fail call
+	budgets    []time.Duration     // recording budget left when Complete/Fail was called
+	reap       func() (int, error) // nil means "nothing expired"
+	reaps      int
+}
+
+// budgetLeft reports how much of the recording deadline is still unspent when
+// a store call arrives. It is the observable for "the budget starts when the
+// job ends": a run that eats it leaves nothing to write the outcome with.
+func budgetLeft(ctx context.Context) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0
+	}
+	return time.Until(deadline)
 }
 
 // Every method starts by refusing a cancelled context. pgx does this — a query on a
@@ -87,6 +101,7 @@ func (f *fakeStore) Complete(ctx context.Context, id, _ string, _ job.State, _ s
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.complete = append(f.complete, id)
+	f.budgets = append(f.budgets, budgetLeft(ctx))
 	return nil
 }
 
@@ -98,7 +113,20 @@ func (f *fakeStore) Fail(ctx context.Context, id, _ string, cause error, _ job.P
 	defer f.mu.Unlock()
 	f.failed = append(f.failed, id)
 	f.lastCause = cause
+	f.budgets = append(f.budgets, budgetLeft(ctx))
 	return job.Decision{State: job.Pending}, nil
+}
+
+func (f *fakeStore) Release(ctx context.Context, id, _, message string) error {
+	if err := refused(ctx); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.released = append(f.released, id)
+	f.releaseWhy = message
+	f.budgets = append(f.budgets, budgetLeft(ctx))
+	return nil
 }
 
 // Accessors. Every one locks: a getter racing a mutator is the data race
@@ -127,6 +155,21 @@ func (f *fakeStore) failedIDs() []string {
 	return slices.Clone(f.failed)
 }
 
+func (f *fakeStore) releasedIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.released)
+}
+
+// releaseReason reports the message the dispatcher handed to the most recent
+// Release. It ends up in the job's event timeline, which is the only durable
+// record of why nothing took the job — the log line is at debug.
+func (f *fakeStore) releaseReason() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.releaseWhy
+}
+
 func (f *fakeStore) renewedIDs() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -150,6 +193,14 @@ func (f *fakeStore) reapCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.reaps
+}
+
+// recordingBudgets reports the unspent recording deadline seen by each
+// Complete/Fail call, in call order.
+func (f *fakeStore) recordingBudgets() []time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.budgets)
 }
 
 // failCause reports the cause the dispatcher handed to the most recent Fail.
@@ -339,6 +390,52 @@ func TestAFailedJobIsReportedWithItsCause(t *testing.T) {
 	}
 }
 
+// Undelivered work costs nothing. Every ErrNoAgents bounce used to reach Fail,
+// which increments the attempt and applies the policy, so a five-second agent
+// restart was enough to bury the queue: leased attempt 0 to dead attempt 5
+// inside a second, measured live. The job never ran, so it goes back as it was.
+func TestAnUndeliveredJobIsReleasedNotFailed(t *testing.T) {
+	s := &fakeStore{lease: onceOneJob("j1")}
+	d := newTestDispatcher(t, s, runnerFunc(func(_ context.Context, j job.Job) error {
+		return fmt.Errorf("assign %s: %w: no agents available", j.ID, job.ErrUndelivered)
+	}))
+
+	stop := run(t, d)
+	defer stop()
+
+	waitFor(t, func() bool { return len(s.releasedIDs()) > 0 })
+	if got := s.releasedIDs()[0]; got != "j1" {
+		t.Errorf("released %q, want j1", got)
+	}
+	if ids := s.failedIDs(); len(ids) != 0 {
+		t.Errorf("Fail called for %v: an undelivered job must not spend an attempt", ids)
+	}
+	// The timeline is where an operator reads this: "no agents available" means
+	// deploy an agent, "agent is slow" means add one, and a bare "released"
+	// means neither question can be answered from the database.
+	if why := s.releaseReason(); !strings.Contains(why, "no agents available") {
+		t.Errorf("Release got message %q, want it to carry the runner's reason", why)
+	}
+}
+
+// The other half of the distinction. An agent that took the job and vanished
+// may have run it, so that attempt is spent and the policy gets its say —
+// releasing here would let a job that crashes its executor retry forever.
+func TestADeliveredFailureStillCostsAnAttempt(t *testing.T) {
+	s := &fakeStore{lease: onceOneJob("j1")}
+	d := newTestDispatcher(t, s, runnerFunc(func(context.Context, job.Job) error {
+		return errors.New("agent disconnected before reporting")
+	}))
+
+	stop := run(t, d)
+	defer stop()
+
+	waitFor(t, func() bool { return len(s.failedIDs()) > 0 })
+	if ids := s.releasedIDs(); len(ids) != 0 {
+		t.Errorf("Release called for %v: the job was delivered, so it costs an attempt", ids)
+	}
+}
+
 // The bound is the difference between a backlog and an OOM.
 func TestNeverMoreThanMaxInFlight(t *testing.T) {
 	var running, peak atomic.Int64
@@ -413,6 +510,31 @@ func TestAJobFinishingDuringShutdownIsStillRecorded(t *testing.T) {
 
 	if ids := s.completedIDs(); len(ids) != 1 {
 		t.Errorf("completed %v, want j1 recorded despite the cancellation", ids)
+	}
+}
+
+// The recording budget belongs to the recording, not to the run. A job lasts
+// as long as its executor holds it — with a gRPC agent that is unbounded — so
+// a deadline created before the run is already spent when there is finally an
+// outcome to write. pgx then refuses the write, the outcome is lost, and the
+// row sits leased until the reaper: exactly the failure this budget exists to
+// prevent. Observed live as "fail failed: context deadline exceeded" against
+// an agent that held one job for 47s.
+func TestRecordingBudgetSurvivesALongJob(t *testing.T) {
+	s := &fakeStore{lease: onceOneJob("j1")}
+	d := newTestDispatcher(t, s, runnerFunc(func(context.Context, job.Job) error {
+		time.Sleep(time.Second) // a fraction of the 5s budget, and enough to see it
+		return nil
+	}))
+
+	stop := run(t, d)
+	defer stop()
+
+	waitFor(t, func() bool { return len(s.recordingBudgets()) == 1 })
+	// Budget granted after the run: ~5s left. Granted before it: ~4s, because
+	// the one-second run ate it.
+	if got := s.recordingBudgets()[0]; got < 4500*time.Millisecond {
+		t.Errorf("Complete saw %v of recording budget left, want more than 4.5s", got)
 	}
 }
 

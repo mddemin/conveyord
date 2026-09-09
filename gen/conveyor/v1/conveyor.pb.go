@@ -425,8 +425,9 @@ func (x *Progress) GetMessage() string {
 type Result struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
-	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`      // empty means success
-	Attempt       int32                  `protobuf:"varint,3,opt,name=attempt,proto3" json:"attempt,omitempty"` // copied from the Assignment being reported
+	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`          // empty means success
+	Attempt       int32                  `protobuf:"varint,3,opt,name=attempt,proto3" json:"attempt,omitempty"`     // copied from the Assignment being reported
+	Permanent     bool                   `protobuf:"varint,4,opt,name=permanent,proto3" json:"permanent,omitempty"` // do not retry: the payload, not the run, is the problem
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -480,6 +481,13 @@ func (x *Result) GetAttempt() int32 {
 		return x.Attempt
 	}
 	return 0
+}
+
+func (x *Result) GetPermanent() bool {
+	if x != nil {
+		return x.Permanent
+	}
+	return false
 }
 
 type Register struct {
@@ -563,11 +571,12 @@ const file_conveyor_v1_conveyor_proto_rawDesc = "" +
 	"\tHeartbeat\";\n" +
 	"\bProgress\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage\"O\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"m\n" +
 	"\x06Result\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12\x18\n" +
-	"\aattempt\x18\x03 \x01(\x05R\aattempt\"I\n" +
+	"\aattempt\x18\x03 \x01(\x05R\aattempt\x12\x1c\n" +
+	"\tpermanent\x18\x04 \x01(\bR\tpermanent\"I\n" +
 	"\bRegister\x12\x19\n" +
 	"\bagent_id\x18\x01 \x01(\tR\aagentId\x12\"\n" +
 	"\fcapabilities\x18\x02 \x03(\tR\fcapabilities2P\n" +

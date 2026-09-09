@@ -24,6 +24,7 @@ type Store interface {
 	Renew(ctx context.Context, id, leasedBy string, d time.Duration) error
 	Complete(ctx context.Context, id, leasedBy string, state job.State, message string) error
 	Fail(ctx context.Context, id, leasedBy string, cause error, p job.Policy) (job.Decision, error)
+	Release(ctx context.Context, id, leasedBy, message string) error
 	ReapExpired(ctx context.Context) (int, error)
 }
 
@@ -95,9 +96,10 @@ func (d *Dispatcher) safeRun(ctx context.Context, j job.Job) (err error) {
 //	renewCtx the renewal pump's handle; a child of jctx so the pump stops
 //	         the moment the job does, without inventing a second reason for
 //	         the runner to stop.
-//	recCtx   detached from cancellation: a result recorded during shutdown
-//	         is still recorded, because pgx refuses writes on a cancelled
-//	         context and the job's outcome would be lost to the reaper.
+//	recCtx   detached from cancellation and created only once the run has
+//	         returned: a result recorded during shutdown is still recorded,
+//	         because pgx refuses writes on a cancelled context and the job's
+//	         outcome would be lost to the reaper.
 func (d *Dispatcher) runOne(ctx context.Context, j job.Job) {
 	defer func() {
 		// Decrement BEFORE signalling: the decrement then happens-before the
@@ -140,21 +142,38 @@ func (d *Dispatcher) runOne(ctx context.Context, j job.Job) {
 		}
 	}()
 
+	err := d.safeRun(jctx, j)
+
+	// The recording budget starts here, not before the run: a job lasts as long
+	// as its agent holds it, so a deadline set up front is already spent by the
+	// time there is an outcome to write — and the outcome is then lost to the
+	// reaper, which is the one thing recCtx exists to prevent.
 	recCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 
-	err := d.safeRun(jctx, j)
 	if err != nil {
 		if c := context.Cause(jctx); errors.Is(c, ErrLeaseLost) {
 			err = fmt.Errorf("%w: %w", err, c) // both chains survive errors.Is
 		}
-		_, err := d.store.Fail(recCtx, j.ID, d.cfg.Name, err, d.cfg.Policy)
-		if errors.Is(err, job.ErrNotFound) {
+		if errors.Is(err, job.ErrUndelivered) {
+			// err.Error() carries the rpc reason (no agents versus every agent
+			// full); the store writes it to the timeline, since this log line
+			// is at debug and a released job is otherwise indistinguishable
+			// from a stuck one.
+			if rerr := d.store.Release(recCtx, j.ID, d.cfg.Name, err.Error()); rerr != nil {
+				d.log.Debug("release failed", "job", j.ID, "err", rerr)
+			}
+			return
+		}
+		_, ferr := d.store.Fail(recCtx, j.ID, d.cfg.Name, err, d.cfg.Policy)
+		switch {
+		case ferr == nil: // the failure was recorded; err is the job's, not ours
+		case errors.Is(ferr, job.ErrNotFound):
 			// Expected exactly when the lease changed hands mid-job: the new
 			// owner owns the row, our write lands as zero rows. Not noise.
-			d.log.Debug("fail failed", "err", err)
-		} else {
-			d.log.Error("fail failed", "err", err)
+			d.log.Debug("fail not recorded", "job", j.ID, "err", ferr)
+		default:
+			d.log.Error("fail failed", "job", j.ID, "err", ferr)
 		}
 		return
 	}
