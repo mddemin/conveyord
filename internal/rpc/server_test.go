@@ -324,6 +324,12 @@ func TestStaleResultFromAbandonedAttemptIsIgnored(t *testing.T) {
 	if err := <-errc; !errors.Is(err, context.Canceled) {
 		t.Fatalf("attempt 1: %v", err)
 	}
+	// Abandoning the attempt puts a CancelJob in the agent's one slot. A live
+	// agent's send pump drains it; this fake channel has no reader, so drain it
+	// here or the retry below is passed over as ErrSlowAgent.
+	if got := (<-send).GetCancelJob().GetJobId(); got != "j-1" {
+		t.Fatalf("abandoned attempt did not produce a CancelJob for j-1, got %q", got)
+	}
 
 	// The store incremented attempt on Fail (store.go:378), so the retry is
 	// attempt 1 and lands on a fresh waiter.
@@ -359,6 +365,78 @@ func TestRunReturnsOnCancel(t *testing.T) {
 	cancel() // lease lost or SIGTERM: dispatch must not wait on a dead agent forever
 	if err := <-errc; !errors.Is(err, context.Canceled) {
 		t.Fatalf("want context.Canceled, got %v", err)
+	}
+}
+
+// Abandoning an attempt must stop the work, not just stop waiting for it.
+// runOne gives up on ErrLeaseLost and on shutdown while the agent keeps
+// running the job — spending a slot, and writing side effects a second agent
+// is about to write again. CancelJob has been on the wire since phase 8 and
+// nothing had ever sent it.
+func TestAbandoningAnAttemptCancelsItOnTheAgent(t *testing.T) {
+	s := NewServer(newFakeHub(), NewRegistry(), slog.Default())
+	send := make(chan *pb.ServerToAgent, 1)
+	s.registry.Register("a-1", nil, send, func() {})
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errc := make(chan error, 1)
+	go func() { errc <- s.Run(ctx, job.Job{ID: "j-1", Type: "x"}) }()
+	if got := (<-send).GetAssignment().GetJobId(); got != "j-1" { // drains the one slot
+		t.Fatalf("assigned %q, want j-1", got)
+	}
+
+	cancel()
+	if err := <-errc; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v, want context.Canceled", err)
+	}
+
+	select {
+	case m := <-send:
+		if got := m.GetCancelJob().GetJobId(); got != "j-1" {
+			t.Fatalf("agent got %T for %q, want a CancelJob for j-1", m.Payload, got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no CancelJob: the agent runs the abandoned attempt to completion")
+	}
+}
+
+// Best effort, as the proto says: an agent that has not drained its last frame
+// is already behind, and a dispatcher abandoning an attempt must not block on
+// it. The lease expiring is the real deadline.
+func TestCancelIsDroppedRatherThanBlocking(t *testing.T) {
+	s := NewServer(newFakeHub(), NewRegistry(), slog.Default())
+	send := make(chan *pb.ServerToAgent, 1)
+	s.registry.Register("a-1", nil, send, func() {})
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errc := make(chan error, 1)
+	go func() { errc <- s.Run(ctx, job.Job{ID: "j-1", Type: "x"}) }()
+	waitFor(t, func() bool { return len(send) == 1 }) // assignment queued, never read
+
+	cancel()
+	select {
+	case err := <-errc:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run returned %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run blocked trying to hand a CancelJob to a full buffer")
+	}
+}
+
+// A closed agent's stream has no reader left, so the frame goes nowhere and
+// the caller is told, rather than the frame sitting in a buffer forever.
+func TestCancelReportsAClosedAgent(t *testing.T) {
+	reg := NewRegistry()
+	send := make(chan *pb.ServerToAgent, 1)
+	a := reg.Register("a-1", nil, send, func() {})
+	reg.Unregister(a)
+
+	if reg.Cancel(a, "j-1") {
+		t.Error("Cancel claimed delivery to an agent that is gone")
+	}
+	if len(send) != 0 {
+		t.Error("a frame was queued on a closed agent's stream")
 	}
 }
 

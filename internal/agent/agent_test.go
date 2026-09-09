@@ -195,6 +195,40 @@ func TestAJobRunsEndToEndOverTheStream(t *testing.T) {
 	}
 }
 
+// The other half of task 4, over a real stream: when the dispatcher abandons
+// an attempt — lease lost, or shutdown — the agent stops working on it. Before
+// CancelJob was ever sent, the job ran to completion for nobody: a slot spent,
+// and side effects written twice once the retry landed elsewhere.
+func TestAbandoningAnAttemptStopsTheWorkOnTheAgent(t *testing.T) {
+	started := make(chan struct{})
+	stopped := make(chan error, 1)
+	srv := liveAgent(t, map[string]Executor{"slow": func(ctx context.Context, _ []byte) error {
+		close(started)
+		<-ctx.Done()
+		stopped <- ctx.Err()
+		return ctx.Err()
+	}}, []string{"slow"})
+
+	ctx, abandon := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- srv.Run(ctx, job.Job{ID: "j-1", Type: "slow"}) }()
+	<-started
+
+	abandon()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v, want context.Canceled", err)
+	}
+
+	select {
+	case err := <-stopped:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("executor stopped with %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the executor is still running an attempt nobody is waiting for")
+	}
+}
+
 // Result.permanent is only useful if it survives the wire as something
 // job.IsPermanent recognises, because that is the single bit store.Fail reads
 // to bury a job instead of retrying it five times.

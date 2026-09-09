@@ -159,6 +159,28 @@ func (r *Registry) Assign(j job.Job) (*Agent, error) {
 	return nil, fmt.Errorf("%w: can't take job's type %q", ErrNoAgents, j.Type)
 }
 
+// Cancel asks a to stop running jobID, and reports whether the frame was
+// queued. Best effort by design: the send buffer holds one frame, and an agent
+// that has not drained its last one is already behind, so the caller logs and
+// moves on rather than blocking a dispatcher on a slow stream. The lease
+// expiring is the real deadline, as the proto says.
+//
+// It lives here rather than on Agent because send and closed are registry-
+// guarded state, and this type is their only synchronization authority.
+func (r *Registry) Cancel(a *Agent, jobID string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if a.closed {
+		return false // the stream is already ending; nothing will read this
+	}
+	select {
+	case a.send <- &pb.ServerToAgent{Payload: &pb.ServerToAgent_CancelJob{CancelJob: &pb.CancelJob{JobId: jobID}}}:
+		return true
+	default:
+		return false
+	}
+}
+
 // CloseAll ends every connected stream without emptying the map: each handler
 // deletes its own entry as it unwinds, so map mutation keeps exactly one
 // owner per agent. Shutdown calls this before grpc.Server.GracefulStop,

@@ -242,8 +242,15 @@ func (s *Server) Run(ctx context.Context, j job.Job) error {
 		}
 	case <-ctx.Done():
 		// Shutdown, or the lease was lost and dispatch has abandoned this
-		// attempt. The agent may still be working on it; the attempt key is
-		// what keeps its late result off the retry's waiter.
+		// attempt. Tell the agent, or it runs a job to completion that nobody
+		// is listening for — burning a slot, and writing whatever side effects
+		// the executor has while another agent redoes the same work.
+		//
+		// The attempt key is what keeps the abandoned attempt's late result
+		// off the retry's waiter; this only stops the work.
+		if !s.registry.Cancel(agent, j.ID) {
+			s.log.Warn("cancel not delivered", "job", j.ID, "attempt", j.Attempt, "agent", agent.ID)
+		}
 		return ctx.Err()
 	}
 }
