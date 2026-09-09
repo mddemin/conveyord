@@ -434,21 +434,21 @@ func (s *Store) Fail(ctx context.Context, id, leasedBy string, cause error, p jo
 	return d, nil
 }
 
-// next_attempt_at is deliberately not written here, which leaves a released
-// job leasable on the very next poll. A now() + Interval delay was the
-// alternative and buys nothing: the job would become eligible exactly when
-// that poll fires anyway. The real fix — skip leasing entirely while no agent
-// is connected — is not available to the dispatcher, which cannot see the
-// registry and must not import internal/rpc.
+// next_attempt_at is written from a caller-supplied delay, and the reason is
+// measured rather than assumed. Leaving the column alone looked free — the job
+// would only be re-leased on the next poll — but runOne signals slotFreed as
+// it returns, so the loop wakes the instant a release lands and re-leases
+// immediately. Live, with one job and no agent connected: 67 lease+release
+// pairs in 8 seconds against a 300 ms poll. The delay is what turns that back
+// into one attempt per interval.
 //
-// ponytail: an agentless queue therefore costs MaxInFlight lease+release pairs
-// per poll interval (32 writes/s at the defaults). Move the skip into
-// runTurn behind a "has capacity" callback if that ever shows up in
-// pg_stat_statements.
+// attempt is still untouched. That is the whole point of Release: the retry
+// budget belongs to work that was actually attempted.
 const releaseJobSQL = `
       WITH released AS (
           UPDATE jobs
-          SET state = 'pending', leased_by = NULL, lease_expires_at = NULL, updated_at = now()
+          SET state = 'pending', leased_by = NULL, lease_expires_at = NULL,
+              next_attempt_at = now() + $4, updated_at = now()
           WHERE id = $1 AND leased_by = $2 AND state = 'leased'
           RETURNING id, state, updated_at
       ), logged AS (
@@ -456,21 +456,24 @@ const releaseJobSQL = `
       )
       SELECT * FROM released`
 
-// Release returns a leased job to pending without touching its retry budget:
-// the work was never delivered to an executor, so nothing was attempted and
-// there is nothing to back off from. attempt and next_attempt_at are left
-// exactly as they were, which is the whole difference from Fail.
+// Release returns a leased job to pending without spending an attempt: the
+// work was never delivered to an executor, so nothing was tried and there is
+// nothing to back off from. attempt is left exactly as it was, which is the
+// whole difference from Fail.
 //
 // message says why, because the store cannot know: "no agents available" asks
-// the operator to deploy an agent, "agent is slow" to add one. It is recorded
-// as the job's event, the only durable copy — the dispatcher logs releases at
-// debug.
+// the operator to deploy an agent, "agent is slow" to add one. It becomes the
+// job's event, the only durable copy — the dispatcher logs releases at debug.
+//
+// retryAfter hides the job until then. Zero means "immediately", which is
+// honest for a one-off release and ruinous for a queue with no agent: see the
+// measurement above.
 //
 // Same fencing as every other write: a dispatcher that has lost the lease gets
 // job.ErrNotFound rather than clearing the lease of whoever now holds it.
-func (s *Store) Release(ctx context.Context, id, leasedBy, message string) error {
+func (s *Store) Release(ctx context.Context, id, leasedBy, message string, retryAfter time.Duration) error {
 	ev := job.Event{Message: message}
-	err := s.pool.QueryRow(ctx, releaseJobSQL, id, leasedBy, message).
+	err := s.pool.QueryRow(ctx, releaseJobSQL, id, leasedBy, message, retryAfter).
 		Scan(&ev.JobID, &ev.State, &ev.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("%w: %s", job.ErrNotFound, id)

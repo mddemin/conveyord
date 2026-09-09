@@ -20,7 +20,7 @@ func TestReleaseReturnsTheJobWithoutSpendingAnAttempt(t *testing.T) {
 	leaseN(t, s, 1, "agent-1")
 	ctx := t.Context()
 
-	if err := s.Release(ctx, "j000", "agent-1", "no agents available"); err != nil {
+	if err := s.Release(ctx, "j000", "agent-1", "no agents available", 0); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 
@@ -38,16 +38,14 @@ func TestReleaseReturnsTheJobWithoutSpendingAnAttempt(t *testing.T) {
 	}
 }
 
-// Nothing failed, so there is nothing to back off from: the job goes straight
-// back into the queue. If Release wrote a next_attempt_at the job would be
-// invisible to Lease for that long, which is the one behaviour separating this
-// from Fail with a zero-attempt policy.
+// With no delay the job goes straight back into the queue — the one-off case,
+// where something else is expected to change before the next poll.
 func TestAReleasedJobIsLeasableAgain(t *testing.T) {
 	s := freshDB(t)
 	leaseN(t, s, 1, "agent-1")
 	ctx := t.Context()
 
-	if err := s.Release(ctx, "j000", "agent-1", "no agents available"); err != nil {
+	if err := s.Release(ctx, "j000", "agent-1", "no agents available", 0); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 
@@ -63,6 +61,28 @@ func TestAReleasedJobIsLeasableAgain(t *testing.T) {
 	}
 }
 
+// And with a delay it waits, which is what stops an agentless queue from
+// spinning: runOne's slotFreed token wakes the poll loop the moment a release
+// lands, so a job released with no delay is re-leased immediately — measured
+// at 67 lease+release pairs in 8 seconds.
+func TestAReleasedJobWaitsOutItsDelay(t *testing.T) {
+	s := freshDB(t)
+	leaseN(t, s, 1, "agent-1")
+	ctx := t.Context()
+
+	if err := s.Release(ctx, "j000", "agent-1", "no agents available", time.Hour); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	jobs, err := s.Lease(ctx, "agent-2", 1, time.Minute)
+	if err != nil {
+		t.Fatalf("Lease: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Errorf("Lease returned %v, want nothing until the delay elapses", ids(jobs))
+	}
+}
+
 // Same fencing as every other write: the dispatcher that lost the lease must
 // not clear the lease of the one that now holds it.
 func TestReleaseRejectsAnotherAgent(t *testing.T) {
@@ -70,7 +90,7 @@ func TestReleaseRejectsAnotherAgent(t *testing.T) {
 	leaseN(t, s, 1, "agent-1")
 	ctx := t.Context()
 
-	err := s.Release(ctx, "j000", "agent-2", "no agents available")
+	err := s.Release(ctx, "j000", "agent-2", "no agents available", 0)
 	if !errors.Is(err, job.ErrNotFound) {
 		t.Fatalf("Release by the wrong agent returned %v, want job.ErrNotFound", err)
 	}
@@ -94,7 +114,7 @@ func TestReleaseRecordsWhyTheJobCameBack(t *testing.T) {
 	leaseN(t, s, 1, "agent-1")
 	ctx := t.Context()
 
-	if err := s.Release(ctx, "j000", "agent-1", "assign j000: not delivered: no agents available"); err != nil {
+	if err := s.Release(ctx, "j000", "agent-1", "assign j000: not delivered: no agents available", 0); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 

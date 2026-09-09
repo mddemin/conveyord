@@ -24,7 +24,7 @@ type Store interface {
 	Renew(ctx context.Context, id, leasedBy string, d time.Duration) error
 	Complete(ctx context.Context, id, leasedBy string, state job.State, message string) error
 	Fail(ctx context.Context, id, leasedBy string, cause error, p job.Policy) (job.Decision, error)
-	Release(ctx context.Context, id, leasedBy, message string) error
+	Release(ctx context.Context, id, leasedBy, message string, retryAfter time.Duration) error
 	ReapExpired(ctx context.Context) (int, error)
 }
 
@@ -160,7 +160,12 @@ func (d *Dispatcher) runOne(ctx context.Context, j job.Job) {
 			// full); the store writes it to the timeline, since this log line
 			// is at debug and a released job is otherwise indistinguishable
 			// from a stuck one.
-			if rerr := d.store.Release(recCtx, j.ID, d.cfg.Name, err.Error()); rerr != nil {
+			//
+			// Interval, not zero: runOne signals slotFreed on the way out, so
+			// a job released with no delay is re-leased the instant this
+			// returns. Measured at 67 lease+release pairs in 8 seconds for one
+			// job against a 300 ms poll.
+			if rerr := d.store.Release(recCtx, j.ID, d.cfg.Name, err.Error(), d.cfg.Interval); rerr != nil {
 				d.log.Debug("release failed", "job", j.ID, "err", rerr)
 			}
 			return

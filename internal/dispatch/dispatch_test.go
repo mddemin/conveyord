@@ -35,18 +35,19 @@ func waitFor(t *testing.T, cond func() bool) {
 type fakeStore struct {
 	mu sync.Mutex
 
-	lease      func(n int) ([]job.Job, error) // nil means "no work"
-	renew      func(id string) error          // nil means "renewal succeeds"
-	leases     int
-	renewed    []string
-	complete   []string
-	failed     []string
-	released   []string
-	releaseWhy string              // message passed to the most recent Release call
-	lastCause  error               // cause passed to the most recent Fail call
-	budgets    []time.Duration     // recording budget left when Complete/Fail was called
-	reap       func() (int, error) // nil means "nothing expired"
-	reaps      int
+	lease        func(n int) ([]job.Job, error) // nil means "no work"
+	renew        func(id string) error          // nil means "renewal succeeds"
+	leases       int
+	renewed      []string
+	complete     []string
+	failed       []string
+	released     []string
+	releaseWhy   string              // message passed to the most recent Release call
+	releaseAfter time.Duration       // retryAfter passed to the most recent Release call
+	lastCause    error               // cause passed to the most recent Fail call
+	budgets      []time.Duration     // recording budget left when Complete/Fail was called
+	reap         func() (int, error) // nil means "nothing expired"
+	reaps        int
 }
 
 // budgetLeft reports how much of the recording deadline is still unspent when
@@ -117,7 +118,7 @@ func (f *fakeStore) Fail(ctx context.Context, id, _ string, cause error, _ job.P
 	return job.Decision{State: job.Pending}, nil
 }
 
-func (f *fakeStore) Release(ctx context.Context, id, _, message string) error {
+func (f *fakeStore) Release(ctx context.Context, id, _, message string, retryAfter time.Duration) error {
 	if err := refused(ctx); err != nil {
 		return err
 	}
@@ -125,6 +126,7 @@ func (f *fakeStore) Release(ctx context.Context, id, _, message string) error {
 	defer f.mu.Unlock()
 	f.released = append(f.released, id)
 	f.releaseWhy = message
+	f.releaseAfter = retryAfter
 	f.budgets = append(f.budgets, budgetLeft(ctx))
 	return nil
 }
@@ -168,6 +170,16 @@ func (f *fakeStore) releaseReason() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.releaseWhy
+}
+
+// releaseDelay reports how long the most recent Release asked the store to
+// hide the job for. Zero means the loop re-leases it the moment runOne's
+// slotFreed token lands, which is a spin against Postgres for as long as no
+// agent is connected.
+func (f *fakeStore) releaseDelay() time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.releaseAfter
 }
 
 func (f *fakeStore) renewedIDs() []string {
@@ -415,6 +427,11 @@ func TestAnUndeliveredJobIsReleasedNotFailed(t *testing.T) {
 	// means neither question can be answered from the database.
 	if why := s.releaseReason(); !strings.Contains(why, "no agents available") {
 		t.Errorf("Release got message %q, want it to carry the runner's reason", why)
+	}
+	// Without a delay the release is a spin: runOne signals slotFreed as it
+	// returns, the loop wakes, and it re-leases a job nothing can take.
+	if got := s.releaseDelay(); got != d.cfg.Interval {
+		t.Errorf("Release asked to hide the job for %s, want the poll interval %s", got, d.cfg.Interval)
 	}
 }
 
