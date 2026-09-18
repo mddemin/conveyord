@@ -36,17 +36,7 @@ jobs:
           go-version-file: go.mod
 
       - name: vet
-        run: go vet ./...
-
-      - name: staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@latest -checks=all $$(go list ./... | grep -v '/gen/')
-
-      - name: gofmt
-        run: |
-          unformatted=$(gofmt -l . | grep -v '^gen/')
-          if [ -n "$unformatted" ]; then
-            echo "gofmt needed:"; echo "$unformatted"; exit 1
-          fi
+        run: make vet
 
       - name: proto lint
         run: go tool buf lint

@@ -43,6 +43,11 @@ func (r agentRegistry) Agents() []httpapi.AgentInfo {
 	agents := r.List()
 	out := make([]httpapi.AgentInfo, 0, len(agents))
 	for _, a := range agents {
+		select {
+		case <-a.Done():
+			continue // CloseAll has ended it; Unregister has not yet dropped the map entry
+		default:
+		}
 		out = append(out, httpapi.AgentInfo{ID: a.ID, Capabilities: r.Capabilities(a)})
 	}
 	return out
@@ -67,12 +72,12 @@ func parseArgs(args []string, dsnEnv string) (config, error) {
 		reapInterval = fs.Duration("reap-interval", 30*time.Second, "expired-lease reaper interval")
 		drain        = fs.Duration("drain", 15*time.Second, "graceful shutdown deadline")
 	)
-	// Loopback by default, because the gRPC listener has no authentication:
-	// anything that can reach it registers, claims any capability, and is
-	// handed jobs. That is a trust boundary, and the safe end of it is the
-	// default. Exposing it off-host is an explicit act — see exposedWarning.
+	// Loopback by default, because neither listener authenticates: anything
+	// that can reach HTTP can enqueue jobs, and anything that can reach gRPC
+	// registers, claims any capability, and is handed those jobs. Exposing
+	// either off-host is an explicit act — see exposedWarning.
 	fs.StringVar(&c.grpcAddr, "grpc-addr", "127.0.0.1:50051", "gRPC listen address; unauthenticated, so off-host exposure needs a network boundary you trust")
-	fs.StringVar(&c.addr, "addr", ":8080", "listen address")
+	fs.StringVar(&c.addr, "addr", "127.0.0.1:8080", "HTTP listen address; unauthenticated, same trust boundary as -grpc-addr")
 	fs.StringVar(&c.dsn, "dsn", "", "Postgres connection string")
 	fs.StringVar(&c.name, "name", "", "dispatcher identity in leased_by")
 
@@ -146,12 +151,11 @@ func serveGRPC(srv *grpc.Server, ln net.Listener) error {
 	return err
 }
 
-// exposedWarning reports why a gRPC bind is a risk, or "" when it is not. The
-// listener authenticates nobody: any process that reaches it registers under
-// any name, claims any capability, and is handed real jobs with real
-// payloads. Phase 10 does not ship mTLS, so the honest position is a
-// loopback default plus a line in the log that says exactly what a wider bind
-// means — silence would be the wrong answer.
+// exposedWarning reports why a bind is a risk, or "" when it is not. Neither
+// listener authenticates: HTTP enqueues jobs, gRPC takes them. Phase 10 does
+// not ship mTLS, so the honest position is a loopback default plus a line in
+// the log that says exactly what a wider bind means — silence would be the
+// wrong answer.
 func exposedWarning(addr net.Addr) string {
 	host, _, err := net.SplitHostPort(addr.String())
 	if err != nil {
@@ -162,7 +166,7 @@ func exposedWarning(addr net.Addr) string {
 	case ip == nil:
 		return ""
 	case ip.IsUnspecified():
-		return "bound to every interface with no authentication: anything that can route to this host can register as an agent and take jobs"
+		return "bound to every interface with no authentication"
 	case !ip.IsLoopback():
 		return "bound off-loopback with no authentication: only expose this inside a network boundary you trust"
 	}
@@ -238,6 +242,9 @@ func run(ctx context.Context, args []string, log *slog.Logger, stop context.Canc
 	// callback, after the last thing that can fail before the group starts.
 	onListen(ln.Addr(), grpcLn.Addr())
 	log.Info("listening", "addr", ln.Addr().String(), "grpc_addr", grpcLn.Addr().String())
+	if why := exposedWarning(ln.Addr()); why != "" {
+		log.Warn("http listener is unauthenticated", "addr", ln.Addr().String(), "risk", why)
+	}
 	if why := exposedWarning(grpcLn.Addr()); why != "" {
 		log.Warn("grpc listener is unauthenticated", "grpc_addr", grpcLn.Addr().String(), "risk", why)
 	}

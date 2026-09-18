@@ -35,9 +35,9 @@ type Server struct {
 
 // waiterKey identifies one attempt, not one job, because two attempts of the
 // same job can be outstanding at once: runOne abandons an attempt when its
-// lease is lost while that agent keeps working, and phase 9 has no CancelJob
-// to stop it. Keyed by job alone, the abandoned attempt's late failure would
-// land on the retry's waiter and bury a job another agent is completing.
+// lease is lost while that agent may keep working (CancelJob is best-effort).
+// Keyed by job alone, the abandoned attempt's late failure would land on the
+// retry's waiter and bury a job another agent is completing.
 type waiterKey struct {
 	jobID   string
 	attempt int32
@@ -114,8 +114,14 @@ func (s *Server) recvPump(stream pb.Conveyor_AssignServer, send chan *pb.ServerT
 			// No row behind this event, so it needs its own timestamp; store
 			// events get theirs from Postgres.
 			pr := p.Progress
+			if pr == nil {
+				continue
+			}
 			s.hub.Publish(job.Event{JobID: pr.JobId, Message: pr.Message, State: job.Leased, CreatedAt: time.Now()})
 		case *pb.AgentToServer_Result:
+			if p.Result == nil {
+				continue
+			}
 			s.deliver(p.Result)
 		case *pb.AgentToServer_Register:
 			// Identity is first-Register-wins; capabilities are mutable.
@@ -125,6 +131,10 @@ func (s *Server) recvPump(stream pb.Conveyor_AssignServer, send chan *pb.ServerT
 			// are selecting on — healthy jobs failed with ErrAgentGone because
 			// an agent announced it had learned a new type.
 			r := p.Register
+			if r == nil || r.AgentId == "" {
+				s.log.Warn("register missing agent_id, ignoring")
+				continue
+			}
 			switch {
 			case agent == nil:
 				agent = s.registry.Register(r.AgentId, r.Capabilities, send, cancel)
@@ -270,8 +280,8 @@ func (s *Server) Run(ctx context.Context, j job.Job) error {
 // Both drop paths are logged and normal. No waiter means the attempt was
 // reaped or abandoned and has already been retried; a full buffer means a
 // duplicate result, which at-least-once delivery makes routine. An empty error
-// string is success — phase 9 has no way to say "permanent", so every failure
-// a result carries is retryable.
+// string is success even if permanent is set — wrapping before that check
+// would bury a job that worked.
 func (s *Server) deliver(r *pb.Result) {
 	key := waiterKey{jobID: r.JobId, attempt: r.Attempt}
 

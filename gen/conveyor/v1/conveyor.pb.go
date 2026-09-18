@@ -546,14 +546,14 @@ var File_conveyor_v1_conveyor_proto protoreflect.FileDescriptor
 
 const file_conveyor_v1_conveyor_proto_rawDesc = "" +
 	"\n" +
-	"\x1aconveyor/v1/conveyor.proto\x12\vconveyor.v1\"\x8e\x01\n" +
+	"\x1aconveyor/v1/conveyor.proto\x12\vconveyor.v1\"\x94\x01\n" +
 	"\rServerToAgent\x129\n" +
 	"\n" +
 	"assignment\x18\x01 \x01(\v2\x17.conveyor.v1.AssignmentH\x00R\n" +
 	"assignment\x127\n" +
 	"\n" +
 	"cancel_job\x18\x03 \x01(\v2\x16.conveyor.v1.CancelJobH\x00R\tcancelJobB\t\n" +
-	"\apayload\"k\n" +
+	"\apayloadJ\x04\b\x02\x10\x03\"k\n" +
 	"\n" +
 	"Assignment\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x12\n" +
@@ -561,13 +561,13 @@ const file_conveyor_v1_conveyor_proto_rawDesc = "" +
 	"\apayload\x18\x03 \x01(\fR\apayload\x12\x18\n" +
 	"\aattempt\x18\x04 \x01(\x05R\aattempt\"\"\n" +
 	"\tCancelJob\x12\x15\n" +
-	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\xeb\x01\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\xf7\x01\n" +
 	"\rAgentToServer\x126\n" +
 	"\theartbeat\x18\x01 \x01(\v2\x16.conveyor.v1.HeartbeatH\x00R\theartbeat\x123\n" +
 	"\bregister\x18\x02 \x01(\v2\x15.conveyor.v1.RegisterH\x00R\bregister\x123\n" +
 	"\bprogress\x18\x05 \x01(\v2\x15.conveyor.v1.ProgressH\x00R\bprogress\x12-\n" +
 	"\x06result\x18\x06 \x01(\v2\x13.conveyor.v1.ResultH\x00R\x06resultB\t\n" +
-	"\apayload\"\v\n" +
+	"\apayloadJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05\"\v\n" +
 	"\tHeartbeat\";\n" +
 	"\bProgress\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x18\n" +

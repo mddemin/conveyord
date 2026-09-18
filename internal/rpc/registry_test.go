@@ -35,6 +35,16 @@ func TestRegistryIsConcurrentSafe(t *testing.T) {
 	}
 }
 
+func TestRegisterRejectsEmptyID(t *testing.T) {
+	r := NewRegistry()
+	if a := r.Register("", nil, make(chan *pb.ServerToAgent, 1), func() {}); a != nil {
+		t.Fatal("empty agent_id must not enter the registry")
+	}
+	if n := len(r.List()); n != 0 {
+		t.Fatalf("List = %d after empty Register, want 0", n)
+	}
+}
+
 // Capabilities is the operator endpoint's only window into the registry, and
 // it hands out a copy for the same reason capabilities is unexported: List
 // gives callers live *Agent pointers, and SetCapabilities rewrites the map

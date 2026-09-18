@@ -62,6 +62,9 @@ func NewRegistry() *Registry {
 // agent's and disconnect the caller. A re-Register on a live stream is a
 // capability update: use SetCapabilities.
 func (r *Registry) Register(id string, caps []string, send chan *pb.ServerToAgent, cancel context.CancelFunc) *Agent {
+	if id == "" {
+		return nil
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 

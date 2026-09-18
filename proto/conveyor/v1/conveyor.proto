@@ -6,6 +6,7 @@ option go_package = "github.com/mddemin/conveyor/gen/conveyor/v1;conveyorv1";
 
 // ServerToAgent is one frame pushed to an agent's open stream.
 message ServerToAgent {
+  reserved 2;
   oneof payload {
     // Assignment hands the agent a job it now holds a server-side lease on.
     Assignment assignment = 1;
@@ -29,6 +30,7 @@ message CancelJob {
 
 // AgentToServer is one frame an agent sends up its open stream.
 message AgentToServer {
+  reserved 3, 4;
   oneof payload {
     Heartbeat heartbeat = 1;
     Register register = 2;

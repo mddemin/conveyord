@@ -95,6 +95,28 @@ func fetchAgents(t *testing.T, base string) []agentResponse {
 	return agents
 }
 
+func TestHTTPDefaultsToLoopback(t *testing.T) {
+	c, err := parseArgs([]string{"-dsn", "postgres://x"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.addr != "127.0.0.1:8080" {
+		t.Errorf("-addr default is %q, want 127.0.0.1:8080", c.addr)
+	}
+}
+
+func TestAgentsOmitsClosedStreams(t *testing.T) {
+	reg := rpc.NewRegistry()
+	reg.Register("dying", nil, make(chan *pb.ServerToAgent, 1), func() {})
+	reg.CloseAll()
+	if n := len(reg.List()); n != 1 {
+		t.Fatalf("List after CloseAll = %d, want 1 (handlers have not Unregistered)", n)
+	}
+	if got := (agentRegistry{reg}).Agents(); len(got) != 0 {
+		t.Fatalf("Agents = %v, want none during shutdown", got)
+	}
+}
+
 // waitFor polls because registration is asynchronous: the client's Send
 // returns before the server's receive pump has run.
 func waitFor(t *testing.T, cond func() bool) {

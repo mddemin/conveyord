@@ -13,10 +13,13 @@ import (
 	pb "github.com/mddemin/conveyor/gen/conveyor/v1"
 	"github.com/mddemin/conveyor/internal/job"
 	"github.com/mddemin/conveyor/internal/rpc"
+	"go.uber.org/goleak"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 )
+
+func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
 
 func testAgent(t *testing.T, execs map[string]Executor) *Agent {
 	t.Helper()

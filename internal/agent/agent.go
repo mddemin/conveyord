@@ -71,6 +71,15 @@ type Agent struct {
 // process can do; an assignment for anything else comes back as a permanent
 // failure.
 func New(cfg Config, execs map[string]Executor, log *slog.Logger) *Agent {
+	if cfg.Concurrency < 1 {
+		cfg.Concurrency = 1 // unbuffered sem would deadlock the first job
+	}
+	if cfg.Heartbeat <= 0 {
+		cfg.Heartbeat = time.Second // NewTicker panics on 0
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = time.Minute
+	}
 	return &Agent{
 		cfg:     cfg,
 		execs:   execs,

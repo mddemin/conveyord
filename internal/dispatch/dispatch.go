@@ -124,7 +124,11 @@ func (d *Dispatcher) runOne(ctx context.Context, j job.Job) {
 		renewCtx, cancelRenew := context.WithCancel(jctx)
 		defer cancelRenew()
 
-		tk := time.NewTicker(d.cfg.Lease / 3)
+		every := d.cfg.Lease / 3
+		if every <= 0 {
+			every = time.Nanosecond // NewTicker panics on 0; Lease/3 is 0 for Lease < 3ns
+		}
+		tk := time.NewTicker(every)
 		defer tk.Stop()
 		for {
 			select {
@@ -166,7 +170,7 @@ func (d *Dispatcher) runOne(ctx context.Context, j job.Job) {
 			// returns. Measured at 67 lease+release pairs in 8 seconds for one
 			// job against a 300 ms poll.
 			if rerr := d.store.Release(recCtx, j.ID, d.cfg.Name, err.Error(), d.cfg.Interval); rerr != nil {
-				d.log.Debug("release failed", "job", j.ID, "err", rerr)
+				d.log.Error("release failed", "job", j.ID, "err", rerr)
 			}
 			return
 		}
@@ -185,7 +189,7 @@ func (d *Dispatcher) runOne(ctx context.Context, j job.Job) {
 
 	err = d.store.Complete(recCtx, j.ID, d.cfg.Name, job.Succeeded, "Completed")
 	if err != nil {
-		d.log.Error("complete failed", "err", err)
+		d.log.Error("complete failed", "job", j.ID, "err", err)
 		return
 	}
 }
