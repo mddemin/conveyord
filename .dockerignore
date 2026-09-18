@@ -1,0 +1,8 @@
+.git
+.obsidian
+.github
+docs/diagrams
+*.test
+*.out
+*.prof
+.env

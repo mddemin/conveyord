@@ -19,7 +19,7 @@ and `goleak` are the only dependencies.
 | 7 | Dispatch loop, lease renewal, lifecycle & graceful shutdown | done |
 | 8–10 | gRPC agents over bidirectional streams | done |
 | 11 | OpenTelemetry traces/metrics, slog trace IDs, pprof | done |
-| 12 | Docker/Compose, load test | planned |
+| 12 | Docker/Compose, load test | done |
 
 ## Architecture
 
@@ -47,24 +47,32 @@ a stalled broadcaster.
 ## Quickstart
 
 ```bash
-# one throwaway Postgres
+# the whole stack: conveyord, two agents, Postgres, Jaeger
+docker compose up --build
+
+curl -sS -X POST 127.0.0.1:8080/jobs \
+  -d '{"type":"sleep","payload":{"duration":"2s"}}'
+
+# traces: http://127.0.0.1:16686
+```
+
+Or run the binaries yourself:
+
+```bash
 docker run -d --name conveyor-pg -p 5432:5432 \
   -e POSTGRES_DB=conveyor -e POSTGRES_USER=conveyor -e POSTGRES_PASSWORD=conveyor \
   postgres:17-alpine
 
-# the daemon (migrates on boot). HTTP and gRPC default to loopback: neither
-# authenticates.
 go run ./cmd/conveyord \
   -dsn "postgres://conveyor:conveyor@127.0.0.1:5432/conveyor?sslmode=disable"
 
-# an agent (separate terminal). Without one, jobs lease and return to pending.
 go run ./cmd/agent -server 127.0.0.1:50051
 ```
 
 Then watch work move through the system live:
 
 ```bash
-curl -N 127.0.0.1:8080/events            # hold the stream open
+curl -N 127.0.0.1:8080/events
 
 curl -sS -X POST 127.0.0.1:8080/jobs \
   -d '{"type":"sleep","payload":{"duration":"2s"}}'
@@ -135,6 +143,11 @@ make vet     # go vet + staticcheck + gofmt check
 ```
 
 Traces export when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. `-pprof 127.0.0.1:6060` on either binary.
+
+```bash
+go run ./cmd/load -n 500 -c 20          # enqueue then wait for drain
+go tool pprof -top http://127.0.0.1:6060/debug/pprof/profile?seconds=10
+```
 
 
 ## License
