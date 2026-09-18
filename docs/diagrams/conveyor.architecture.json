@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Conveyor: Control Plane and Agent Fleet",
+    "locale": "en",
+    "output": "conveyor-architecture.html",
+    "quality_profile": "showcase",
+    "views": [
+      { "id": "enqueue-path", "label": "Enqueue path", "focus": ["clients", "httpapi", "store", "postgres"], "note": "A job enters over HTTP and becomes a pending row in Postgres." },
+      { "id": "execution-path", "label": "Lease and execution", "focus": ["dispatch", "store", "rpcsrv", "agents"], "note": "The dispatcher leases work and blocks on the agent's result over a bidirectional stream." },
+      { "id": "observability", "label": "Live event stream", "focus": ["store", "rpcsrv", "hub", "httpapi"], "note": "Every state change and agent progress frame fans out to SSE subscribers." }
+    ]
+  },
+  "components": [
+    { "id": "clients", "type": "external", "label": "Operators / Clients", "sublabel": "curl, HTTP tooling", "pos": [40, 330], "size": [160, 68] },
+    { "id": "hub", "type": "messagebus", "label": "Event Hub", "sublabel": "internal/hub", "tag": "lossy fan-out", "pos": [270, 110], "size": [180, 68] },
+    { "id": "httpapi", "type": "backend", "label": "HTTP API", "sublabel": "internal/httpapi :8080", "tag": "REST + SSE", "pos": [270, 330], "size": [180, 68] },
+    { "id": "store", "type": "backend", "label": "Job Store", "sublabel": "internal/store (pgx)", "tag": "SKIP LOCKED", "pos": [550, 330], "size": [180, 68] },
+    { "id": "dispatch", "type": "backend", "label": "Dispatcher", "sublabel": "internal/dispatch", "tag": "lease, renew, reap", "pos": [550, 560], "size": [180, 68] },
+    { "id": "rpcsrv", "type": "backend", "label": "Agent Gateway", "sublabel": "internal/rpc :50051", "tag": "bidi gRPC stream", "pos": [830, 560], "size": [180, 68] },
+    { "id": "postgres", "type": "database", "label": "PostgreSQL", "sublabel": "jobs, job_events", "brand": "postgresql", "pos": [1130, 330], "size": [180, 68] },
+    { "id": "agents", "type": "external", "label": "Agents", "sublabel": "cmd/agent", "tag": "sleep, checksum", "pos": [1130, 560], "size": [180, 68] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "conveyord process", "wraps": ["hub", "httpapi", "store", "dispatch", "rpcsrv"] },
+    { "kind": "security-group", "label": "127.0.0.1:50051, unauthenticated", "wraps": ["rpcsrv"] }
+  ],
+  "connections": [
+    { "id": "client-http", "from": "clients", "to": "httpapi", "label": "POST /jobs, GET /events", "variant": "emphasis", "labelDx": -74, "labelDy": -58 },
+    { "id": "api-store", "from": "httpapi", "to": "store", "label": "Enqueue, List" },
+    { "id": "store-pg", "from": "store", "to": "postgres", "label": "SQL over pgx pool" },
+    { "id": "store-hub", "from": "store", "to": "hub", "label": "publish every state change", "variant": "dashed", "fromSide": "top", "toSide": "right" },
+    { "id": "hub-api", "from": "hub", "to": "httpapi", "label": "SSE frames, drops slow subscribers", "variant": "dashed", "labelDy": 86 },
+    { "id": "dispatch-store", "from": "dispatch", "to": "store", "label": "lease, renew, complete, fail, release", "fromSide": "top", "toSide": "bottom" },
+    { "id": "dispatch-rpc", "from": "dispatch", "to": "rpcsrv", "label": "Run(job) blocks for the result", "variant": "emphasis", "labelDy": -51 },
+    { "id": "rpc-assign", "from": "rpcsrv", "to": "agents", "label": "Assignment, capability matched", "labelDy": -51 },
+    { "id": "agent-result", "from": "agents", "to": "rpcsrv", "label": "Result, Progress, Heartbeat", "labelDy": 75 },
+    { "id": "rpc-hub", "from": "rpcsrv", "to": "hub", "label": "agent progress as job events", "variant": "dashed", "fromSide": "bottom", "toSide": "left", "via": [[920, 700], [20, 700], [20, 144]], "labelSegment": 1, "labelDy": -24 }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Edge", "items": ["POST /jobs enqueues, GET /events streams SSE", "GET /agents reads the live fleet from the registry", "Slow SSE subscribers get dropped frames and a lagged signal"] },
+    { "dot": "emerald", "title": "Dispatch", "items": ["SKIP LOCKED leasing, bounded in-flight, renewal pump", "rpc.Server.Run blocks until the agent reports", "Work no agent took is released, no attempt spent"] },
+    { "dot": "rose", "title": "Crash safety and risk", "items": ["Expired leases are reaped to pending: at-least-once", "Executors must be idempotent; Postgres is the record", "gRPC listener authenticates nobody: loopback default"] }
+  ]
+}
