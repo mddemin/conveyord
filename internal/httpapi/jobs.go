@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/mddemin/conveyor/internal/job"
+	"github.com/mddemin/conveyor/internal/obs"
 )
 
 const MaxLimit = 1000
@@ -30,7 +31,7 @@ func (a *API) enqueue(w http.ResponseWriter, r *http.Request) {
 		id = rand.Text()[:16]
 	}
 
-	j := &job.Job{ID: id, Type: req.Type, Payload: req.Payload, State: job.Pending}
+	j := &job.Job{ID: id, Type: req.Type, Payload: req.Payload, State: job.Pending, Traceparent: obs.Traceparent(r.Context())}
 	if err := a.store.Enqueue(r.Context(), j); err != nil {
 		a.writeError(w, r, err)
 		return

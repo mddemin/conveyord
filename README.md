@@ -18,7 +18,8 @@ and `goleak` are the only dependencies.
 | 6 | SSE hub: slow-subscriber drops, lagged signal, heartbeats | done |
 | 7 | Dispatch loop, lease renewal, lifecycle & graceful shutdown | done |
 | 8–10 | gRPC agents over bidirectional streams | done |
-| 11–12 | OpenTelemetry, Docker/Compose, load test | planned |
+| 11 | OpenTelemetry traces/metrics, slog trace IDs, pprof | done |
+| 12 | Docker/Compose, load test | planned |
 
 ## Architecture
 
@@ -132,6 +133,9 @@ go test -race ./...
 make test    # go test -race ./...
 make vet     # go vet + staticcheck + gofmt check
 ```
+
+Traces export when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. `-pprof 127.0.0.1:6060` on either binary.
+
 
 ## License
 

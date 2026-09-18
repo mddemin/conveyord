@@ -16,12 +16,12 @@ message ServerToAgent {
     CancelJob cancel_job = 3;
   }
 }
-
 message Assignment {
   string job_id = 1;
   string type = 2;
   bytes payload = 3;
   int32 attempt = 4; // job.Job.Attempt at lease time; agents echo it verbatim
+  string traceparent = 5; // W3C carrier; empty means start a new root on the agent
 }
 
 message CancelJob {

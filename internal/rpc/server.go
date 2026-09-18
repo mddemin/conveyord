@@ -11,6 +11,7 @@ import (
 
 	pb "github.com/mddemin/conveyor/gen/conveyor/v1"
 	"github.com/mddemin/conveyor/internal/job"
+	"github.com/mddemin/conveyor/internal/obs"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -207,6 +208,10 @@ func (s *Server) Assign(stream pb.Conveyor_AssignServer) error {
 // reaper never sees the job and the MaxInFlight slot would be lost for the
 // life of the process.
 func (s *Server) Run(ctx context.Context, j job.Job) error {
+	ctx, span := obs.Start(ctx, "rpc.assign", obs.JobAttrs(j.ID, j.Type)...)
+	defer span.End()
+	j.Traceparent = obs.Traceparent(ctx)
+
 	key := waiterKey{jobID: j.ID, attempt: int32(j.Attempt)}
 	result := make(chan error, 1)
 

@@ -19,8 +19,10 @@ import (
 	"github.com/mddemin/conveyor/internal/httpapi"
 	"github.com/mddemin/conveyor/internal/hub"
 	"github.com/mddemin/conveyor/internal/job"
+	"github.com/mddemin/conveyor/internal/obs"
 	"github.com/mddemin/conveyor/internal/rpc"
 	"github.com/mddemin/conveyor/internal/store"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
@@ -56,6 +58,7 @@ func (r agentRegistry) Agents() []httpapi.AgentInfo {
 type config struct {
 	grpcAddr     string
 	addr         string
+	pprof        string
 	dsn          string
 	name         string
 	drainTimeout time.Duration
@@ -78,6 +81,7 @@ func parseArgs(args []string, dsnEnv string) (config, error) {
 	// either off-host is an explicit act — see exposedWarning.
 	fs.StringVar(&c.grpcAddr, "grpc-addr", "127.0.0.1:50051", "gRPC listen address; unauthenticated, so off-host exposure needs a network boundary you trust")
 	fs.StringVar(&c.addr, "addr", "127.0.0.1:8080", "HTTP listen address; unauthenticated, same trust boundary as -grpc-addr")
+	fs.StringVar(&c.pprof, "pprof", "", "pprof listen address; empty disables it")
 	fs.StringVar(&c.dsn, "dsn", "", "Postgres connection string")
 	fs.StringVar(&c.name, "name", "", "dispatcher identity in leased_by")
 
@@ -117,11 +121,18 @@ func parseArgs(args []string, dsnEnv string) (config, error) {
 }
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	log := slog.New(obs.Handler{Handler: slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})})
 	slog.SetDefault(log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	shutdown, err := obs.Setup(ctx, "conveyord")
+	if err != nil {
+		log.Error("exiting", "err", err)
+		os.Exit(1)
+	}
+	defer shutdown(context.WithoutCancel(ctx))
 
 	if err := run(ctx, os.Args[1:], log, stop, func(_, _ net.Addr) {}); err != nil && !errors.Is(err, context.Canceled) {
 		log.Error("exiting", "err", err)
@@ -221,7 +232,7 @@ func run(ctx context.Context, args []string, log *slog.Logger, stop context.Canc
 	srv := &http.Server{
 		Addr:              cfg.addr,
 		BaseContext:       func(net.Listener) context.Context { return baseCtx },
-		Handler:           api,
+		Handler:           otelhttp.NewHandler(api, "http"),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelError),
@@ -288,6 +299,7 @@ func run(ctx context.Context, args []string, log *slog.Logger, stop context.Canc
 		return gctx.Err()
 	})
 	g.Go(func() error { return serve(srv, ln) }) // returns nil on ErrServerClosed
+	g.Go(func() error { return obs.ServePprof(gctx, cfg.pprof) })
 	g.Go(func() error { return d.Run(gctx) })
 	g.Go(func() error { return d.Reap(gctx) })
 	g.Go(func() error { // shutdown sequencer. Owner: this group. Stop: gctx. Error: Shutdown's result.

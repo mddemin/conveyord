@@ -4,13 +4,14 @@ import "time"
 
 // Job is a unit of work
 type Job struct {
-	ID        string    // unique identifier
-	Type      string    // selects the executor that runs the job
-	Payload   []byte    // the executor's opaque input
-	State     State     // current lifecycle position
-	Attempt   int       // completed attempts; zero before the first run
-	CreatedAt time.Time // time when job was created, this package never sets it
-	UpdatedAt time.Time // time when job was updated, this package never sets it
+	ID          string    // unique identifier
+	Type        string    // selects the executor that runs this job
+	Payload     []byte    // the executor's opaque input
+	State       State     // current lifecycle position
+	Attempt     int       // completed attempts; zero before the first run
+	CreatedAt   time.Time // time when job was created, this package never sets it
+	UpdatedAt   time.Time // time when job was updated, this package never sets it
+	Traceparent string    // W3C carrier from enqueue; this package never sets it
 }
 
 // To moves the job to the next state.

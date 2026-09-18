@@ -73,7 +73,7 @@ func (a *API) withLogging(next http.Handler) http.Handler {
 		rec := &recorder{ResponseWriter: w, status: http.StatusOK}
 		start := time.Now()
 		defer func() {
-			a.logger(r.Context()).Info("request",
+			a.logger(r.Context()).InfoContext(r.Context(), "request",
 				"method", r.Method,
 				"path", r.URL.Path,
 				"status", rec.status,
@@ -93,7 +93,7 @@ func (a *API) withRecover(next http.Handler) http.Handler {
 				if v == http.ErrAbortHandler {
 					panic(v) // not mine to handle
 				}
-				a.logger(r.Context()).Error("panic recovered",
+				a.logger(r.Context()).ErrorContext(r.Context(), "panic recovered",
 					"err", v,
 					"stack", string(debug.Stack()),
 					"method", r.Method,

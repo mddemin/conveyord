@@ -32,6 +32,25 @@ func TestEnqueueStoresAPendingJob(t *testing.T) {
 	}
 }
 
+func TestEnqueuePersistsTraceparentAcrossLease(t *testing.T) {
+	s := freshDB(t)
+	const carrier = "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"
+	j := &job.Job{ID: "j1", Type: "resize", Traceparent: carrier}
+	if err := s.Enqueue(t.Context(), j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	got, err := s.Lease(t.Context(), "worker", 1, time.Minute)
+	if err != nil {
+		t.Fatalf("Lease: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("leased %d jobs, want 1", len(got))
+	}
+	if got[0].Traceparent != carrier {
+		t.Errorf("Traceparent = %q, want the carrier stored at enqueue", got[0].Traceparent)
+	}
+}
+
 func TestEnqueueIgnoresCallerSuppliedState(t *testing.T) {
 	s := freshDB(t)
 

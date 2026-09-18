@@ -14,7 +14,7 @@ import (
 func TestCapabilitiesDefaultToTheExecutorMap(t *testing.T) {
 	execs := defaultExecutors(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	_, cfg, err := parseArgs([]string{"-name", "a-1"}, execs)
+	_, _, cfg, err := parseArgs([]string{"-name", "a-1"}, execs)
 	if err != nil {
 		t.Fatalf("parseArgs: %v", err)
 	}
@@ -24,7 +24,7 @@ func TestCapabilitiesDefaultToTheExecutorMap(t *testing.T) {
 	}
 
 	// And -types narrows it, for an agent dedicated to one kind of work.
-	_, cfg, err = parseArgs([]string{"-name", "a-1", "-types", "sleep"}, execs)
+	_, _, cfg, err = parseArgs([]string{"-name", "a-1", "-types", "sleep"}, execs)
 	if err != nil {
 		t.Fatalf("parseArgs: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestNonsenseFlagsAreRejected(t *testing.T) {
 		{"-timeout", "0"},
 		{"-heartbeat", "-1s"},
 	} {
-		if _, _, err := parseArgs(args, execs); err == nil {
+		if _, _, _, err := parseArgs(args, execs); err == nil {
 			t.Errorf("parseArgs%v was accepted", args)
 		}
 	}
@@ -53,7 +53,7 @@ func TestNonsenseFlagsAreRejected(t *testing.T) {
 // The defaults have to be usable unconfigured: an agent started with no flags
 // at all still identifies itself and still bounds its work.
 func TestDefaultsAreUsable(t *testing.T) {
-	server, cfg, err := parseArgs(nil, defaultExecutors(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	server, _, cfg, err := parseArgs(nil, defaultExecutors(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	if err != nil {
 		t.Fatalf("parseArgs: %v", err)
 	}

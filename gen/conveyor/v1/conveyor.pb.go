@@ -112,7 +112,8 @@ type Assignment struct {
 	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
 	Type          string                 `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`
 	Payload       []byte                 `protobuf:"bytes,3,opt,name=payload,proto3" json:"payload,omitempty"`
-	Attempt       int32                  `protobuf:"varint,4,opt,name=attempt,proto3" json:"attempt,omitempty"` // job.Job.Attempt at lease time; agents echo it verbatim
+	Attempt       int32                  `protobuf:"varint,4,opt,name=attempt,proto3" json:"attempt,omitempty"`        // job.Job.Attempt at lease time; agents echo it verbatim
+	Traceparent   string                 `protobuf:"bytes,5,opt,name=traceparent,proto3" json:"traceparent,omitempty"` // W3C carrier; empty means start a new root on the agent
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -173,6 +174,13 @@ func (x *Assignment) GetAttempt() int32 {
 		return x.Attempt
 	}
 	return 0
+}
+
+func (x *Assignment) GetTraceparent() string {
+	if x != nil {
+		return x.Traceparent
+	}
+	return ""
 }
 
 type CancelJob struct {
@@ -553,13 +561,14 @@ const file_conveyor_v1_conveyor_proto_rawDesc = "" +
 	"assignment\x127\n" +
 	"\n" +
 	"cancel_job\x18\x03 \x01(\v2\x16.conveyor.v1.CancelJobH\x00R\tcancelJobB\t\n" +
-	"\apayloadJ\x04\b\x02\x10\x03\"k\n" +
+	"\apayloadJ\x04\b\x02\x10\x03\"\x8d\x01\n" +
 	"\n" +
 	"Assignment\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12\x18\n" +
 	"\apayload\x18\x03 \x01(\fR\apayload\x12\x18\n" +
-	"\aattempt\x18\x04 \x01(\x05R\aattempt\"\"\n" +
+	"\aattempt\x18\x04 \x01(\x05R\aattempt\x12 \n" +
+	"\vtraceparent\x18\x05 \x01(\tR\vtraceparent\"\"\n" +
 	"\tCancelJob\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\"\xf7\x01\n" +
 	"\rAgentToServer\x126\n" +

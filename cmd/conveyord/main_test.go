@@ -16,9 +16,11 @@ import (
 	"time"
 
 	pb "github.com/mddemin/conveyor/gen/conveyor/v1"
+	"github.com/mddemin/conveyor/internal/agent"
 	"github.com/mddemin/conveyor/internal/httpapi"
 	"github.com/mddemin/conveyor/internal/hub"
 	"github.com/mddemin/conveyor/internal/job"
+	"github.com/mddemin/conveyor/internal/obs"
 	"github.com/mddemin/conveyor/internal/pgtest"
 	"github.com/mddemin/conveyor/internal/rpc"
 	"github.com/mddemin/conveyor/internal/store"
@@ -303,5 +305,85 @@ func TestSIGTERMDrainsAnInFlightJob(t *testing.T) {
 	}
 	if got.State != job.Pending || got.Attempt != 1 {
 		t.Errorf("after SIGTERM the job is %s attempt %d, want pending attempt 1 (retried, not abandoned)", got.State, got.Attempt)
+	}
+}
+
+func TestEnqueueIsOneConnectedTrace(t *testing.T) {
+	rec, restore := obs.TestProvider()
+	defer restore()
+
+	dsn := pgtest.DSN(t)
+	pool := pgtest.Pool(t)
+	if err := store.Migrate(t.Context(), pool); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if _, err := pool.Exec(t.Context(), `TRUNCATE jobs, job_events RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	errc := make(chan error, 1)
+	addrc := make(chan [2]net.Addr, 1)
+	go func() {
+		errc <- run(ctx, []string{"-addr", "127.0.0.1:0", "-dsn", dsn, "-grpc-addr", "127.0.0.1:0", "-poll", "50ms"}, testLogger(t), func() {},
+			func(httpAddr, grpcAddr net.Addr) { addrc <- [2]net.Addr{httpAddr, grpcAddr} })
+	}()
+	addrs := <-addrc
+	base := "http://" + addrs[0].String()
+
+	conn, err := grpc.NewClient(addrs[1].String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dialling gRPC: %v", err)
+	}
+	defer conn.Close()
+
+	ag := agent.New(agent.Config{Name: "trace-agent", Concurrency: 1, Heartbeat: time.Second, Timeout: time.Minute},
+		map[string]agent.Executor{"checksum": func(context.Context, []byte) error { return nil }},
+		testLogger(t))
+	agentErr := make(chan error, 1)
+	go func() { agentErr <- ag.Run(ctx, conn) }()
+	waitFor(t, func() bool { return len(fetchAgents(t, base)) == 1 })
+
+	resp, err := http.Post(base+"/jobs", "application/json", strings.NewReader(`{"type":"checksum","payload":{"x":1}}`))
+	if err != nil {
+		t.Fatalf("POST /jobs: %v", err)
+	}
+	var created jobResponse
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /jobs returned %d, want 201", resp.StatusCode)
+	}
+
+	waitFor(t, func() bool {
+		got, err := store.New(pool, hub.New()).Get(t.Context(), created.ID)
+		return err == nil && got.State == job.Succeeded
+	})
+
+	cancel()
+	<-errc
+	<-agentErr
+
+	ended := rec.Ended()
+	byName := map[string]string{}
+	for _, sp := range ended {
+		byName[sp.Name()] = sp.SpanContext().TraceID().String()
+	}
+	want := []string{"POST", "dispatch.run", "rpc.assign", "agent.execute"}
+	var traceID string
+	for _, name := range want {
+		id, ok := byName[name]
+		if !ok {
+			t.Errorf("missing span %q among %v", name, byName)
+			continue
+		}
+		if traceID == "" {
+			traceID = id
+		} else if id != traceID {
+			t.Errorf("span %s on trace %s, want %s", name, id, traceID)
+		}
 	}
 }

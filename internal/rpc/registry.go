@@ -160,7 +160,7 @@ func (r *Registry) Assign(j job.Job) (*Agent, error) {
 	defer r.mu.RUnlock()
 
 	slow := false
-	msg := &pb.ServerToAgent{Payload: &pb.ServerToAgent_Assignment{Assignment: &pb.Assignment{JobId: j.ID, Type: j.Type, Payload: j.Payload, Attempt: int32(j.Attempt)}}}
+	msg := &pb.ServerToAgent{Payload: &pb.ServerToAgent_Assignment{Assignment: &pb.Assignment{JobId: j.ID, Type: j.Type, Payload: j.Payload, Attempt: int32(j.Attempt), Traceparent: j.Traceparent}}}
 	for _, a := range r.agents {
 		if a.closed {
 			continue

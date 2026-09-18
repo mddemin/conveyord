@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mddemin/conveyor/internal/job"
+	"github.com/mddemin/conveyor/internal/obs"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -26,6 +27,7 @@ type Store interface {
 	Fail(ctx context.Context, id, leasedBy string, cause error, p job.Policy) (job.Decision, error)
 	Release(ctx context.Context, id, leasedBy, message string, retryAfter time.Duration) error
 	ReapExpired(ctx context.Context) (int, error)
+	PendingCount(ctx context.Context) (int, error)
 }
 
 // Runner executes one job. Phase 9 replaces the local implementation with
@@ -111,6 +113,14 @@ func (d *Dispatcher) runOne(ctx context.Context, j job.Job) {
 		case d.slotFreed <- struct{}{}: // leave a token for the sleeping loop
 		default: // a token is already there; drop mine
 		}
+	}()
+
+	started := time.Now()
+	ctx = obs.Continue(ctx, j.Traceparent)
+	ctx, span := obs.Start(ctx, "dispatch.run", obs.JobAttrs(j.ID, j.Type)...)
+	defer func() {
+		obs.JobDuration.Record(ctx, time.Since(started).Seconds())
+		span.End()
 	}()
 
 	jctx, cancelJob := context.WithCancelCause(ctx)
@@ -212,6 +222,11 @@ func (d *Dispatcher) runTurn(ctx context.Context, g *errgroup.Group) bool {
 		free = d.cfg.MaxInFlight - int(d.inFlight.Load())
 	}
 
+	if n, err := d.store.PendingCount(ctx); err != nil {
+		d.log.Debug("pending count failed", "err", err)
+	} else {
+		obs.QueueDepth.Record(ctx, int64(n))
+	}
 	leased, err := d.store.Lease(ctx, d.cfg.Name, free, d.cfg.Lease)
 	if err != nil {
 		d.log.Error("lease failed", "err", err)
@@ -269,6 +284,7 @@ func (d *Dispatcher) reapTurn(ctx context.Context) int {
 		return 0
 	}
 	if reaped > 0 {
+		obs.LeaseExpired.Add(ctx, int64(reaped))
 		d.log.Info("reaped expired leases", "count", reaped)
 	}
 	return reaped

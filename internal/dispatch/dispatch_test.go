@@ -201,6 +201,13 @@ func (f *fakeStore) ReapExpired(ctx context.Context) (int, error) {
 	return f.reap()
 }
 
+func (f *fakeStore) PendingCount(ctx context.Context) (int, error) {
+	if err := refused(ctx); err != nil {
+		return 0, err
+	}
+	return 0, nil
+}
+
 func (f *fakeStore) reapCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

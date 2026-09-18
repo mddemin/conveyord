@@ -21,6 +21,7 @@ import (
 
 	pb "github.com/mddemin/conveyor/gen/conveyor/v1"
 	"github.com/mddemin/conveyor/internal/job"
+	"github.com/mddemin/conveyor/internal/obs"
 	"google.golang.org/grpc"
 )
 
@@ -215,6 +216,7 @@ func (a *Agent) start(ctx context.Context, send chan<- *pb.AgentToServer, asg *p
 
 	// ponytail: one timeout for every type. Per-type limits go in a
 	// map[string]time.Duration beside execs the day two types disagree.
+	ctx, span := obs.Start(obs.Continue(ctx, asg.GetTraceparent()), "agent.execute", obs.JobAttrs(asg.GetJobId(), asg.GetType())...)
 	jctx, cancel := context.WithTimeout(ctx, a.cfg.Timeout)
 	key := jobKey{id: asg.GetJobId(), attempt: asg.GetAttempt()}
 
@@ -223,6 +225,7 @@ func (a *Agent) start(ctx context.Context, send chan<- *pb.AgentToServer, asg *p
 	a.mu.Unlock()
 
 	go func() {
+		defer span.End()
 		defer cancel()
 		defer func() {
 			a.mu.Lock()

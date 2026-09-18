@@ -52,8 +52,8 @@ type nopPublisher struct{}
 func (nopPublisher) Publish(job.Event) {}
 
 const insertJobSQL = `
-      INSERT INTO jobs (id, type, payload, state)
-      VALUES ($1, $2, $3, $4)
+      INSERT INTO jobs (id, type, payload, state, traceparent)
+      VALUES ($1, $2, $3, $4, $5)
       RETURNING created_at, updated_at`
 
 const insertJobEventSQL = `
@@ -72,7 +72,7 @@ func (s *Store) Enqueue(ctx context.Context, j *job.Job) error {
 		}
 		err := tx.QueryRow(ctx,
 			insertJobSQL,
-			j.ID, j.Type, payload, job.Pending).Scan(&j.CreatedAt, &j.UpdatedAt)
+			j.ID, j.Type, payload, job.Pending, j.Traceparent).Scan(&j.CreatedAt, &j.UpdatedAt)
 		if err != nil {
 			if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
 				if pgErr.Code == uniqueViolation {
@@ -207,7 +207,7 @@ const leaseJobSQL = `
               LIMIT $1
               FOR UPDATE SKIP LOCKED
           )
-          RETURNING id, type, payload, state, attempt, created_at, updated_at
+          RETURNING id, type, payload, state, attempt, created_at, updated_at, traceparent
       ), logged AS (
           INSERT INTO job_events (job_id, state, message)
           SELECT id, state, 'leased by ' || $2 FROM leased
@@ -364,6 +364,15 @@ func (s *Store) ReapExpired(ctx context.Context) (int, error) {
 		s.events.Publish(ev)
 	}
 	return len(events), nil
+}
+
+func (s *Store) PendingCount(ctx context.Context) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE state = 'pending'`).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("counting pending jobs: %w", err)
+	}
+	return n, nil
 }
 
 const getFailedJobSQL = `
